@@ -10691,6 +10691,7 @@ pub mod processor {
                 //   1. [writable] Slab account
                 //   2. []         Clock sysvar
                 //   3. []         Oracle account (Pyth/Chainlink/authority — same as liquidation)
+                //   4.. []       (optional) Backup oracle accounts for non-hyperp markets
                 accounts::expect_len(accounts, 4)?;
                 let a_caller = &accounts[0];
                 let a_slab = &accounts[1];
