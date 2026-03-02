@@ -10692,8 +10692,10 @@ pub mod processor {
                 //   2. []         Clock sysvar
                 //   3. []         Oracle account (Pyth/Chainlink/authority — same as liquidation)
                 accounts::expect_len(accounts, 4)?;
+                let a_caller = &accounts[0];
                 let a_slab = &accounts[1];
                 let a_oracle = &accounts[3];
+                accounts::expect_signer(a_caller)?;
                 accounts::expect_writable(a_slab)?;
 
                 let mut data = state::slab_data_mut(a_slab)?;
@@ -10710,7 +10712,10 @@ pub mod processor {
 
                 let clock = Clock::from_account_info(&accounts[2])?;
 
-                // Read oracle price (same logic as liquidation)
+                // Read oracle price (same logic as liquidation).
+                // NOTE: For non-hyperp markets with backup oracles, callers must pass
+                // additional oracle accounts beyond accounts[3]. The current expect_len(4)
+                // is the minimum; read_price_clamped reads from accounts[4..] for backups.
                 let is_hyperp = oracle::is_hyperp_mode(&config);
                 let price = if is_hyperp {
                     let idx = config.last_effective_price_e6;
