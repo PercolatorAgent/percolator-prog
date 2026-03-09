@@ -3769,6 +3769,8 @@ fn nightly_ema_mark_identity_at_equilibrium() {
 }
 
 /// EMA cap bound is monotone in dt_slots: more time allows more movement.
+/// Moved to nightly_ — symbolic u64 mul/div triple (mark * cap * dt) causes
+/// SAT solver to time out in PR CI (~45 min budget exhausted). See issue #975.
 #[kani::proof]
 fn nightly_mark_cap_bound_monotone_in_dt() {
     let mark_prev: u64 = kani::any();
@@ -6016,6 +6018,8 @@ fn proof_rebalancing_mode_never_permanent() {
 // ---------------------------------------------------------------------------
 
 /// Prove: HWM floor math is correct (no rounding up).
+/// Moved to nightly_ — symbolic u128 mul/div (epoch_hwm * hwm_floor_bps / 10_000)
+/// causes SAT solver to time out in PR CI (~45 min budget exhausted). See issue #975.
 #[cfg(kani)]
 #[kani::proof]
 fn nightly_hwm_floor_correct_math() {
