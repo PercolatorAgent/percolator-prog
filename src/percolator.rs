@@ -2418,6 +2418,11 @@ pub mod ix {
             user_idx_a: u16,
             user_idx_b: u16,
         },
+        /// PERC-623: Anyone can top up a market's keeper fund by transferring
+        /// lamports. The amount is read from instruction data (u64).
+        TopUpKeeperFund {
+            amount: u64,
+        },
     }
 
     impl Instruction {
@@ -2894,6 +2899,10 @@ pub mod ix {
                         user_idx_a,
                         user_idx_b,
                     })
+                }
+                TAG_TOPUP_KEEPER_FUND => {
+                    let amount = read_u64(&mut rest)?;
+                    Ok(Instruction::TopUpKeeperFund { amount })
                 }
                 _ => Err(ProgramError::InvalidInstructionData),
             }
@@ -6545,6 +6554,235 @@ pub mod cross_margin {
     }
 }
 
+// 8b. mod keeper_fund — PERC-623: Self-Funding Keeper
+pub mod keeper_fund {
+    use bytemuck::{Pod, Zeroable};
+
+    /// Magic bytes for KeeperFundState PDA: "KEEPFUND"
+    pub const KEEPER_FUND_MAGIC: u64 = 0x4B454550_46554E44;
+
+    /// Size of the KeeperFundState account data.
+    pub const KEEPER_FUND_STATE_LEN: usize = core::mem::size_of::<KeeperFundState>();
+
+    /// Default split: 30% of creation deposit goes to keeper fund.
+    pub const KEEPER_FUND_SPLIT_BPS: u64 = 3_000;
+
+    /// Default reward per successful KeeperCrank (in base token lamports).
+    /// ~0.001 SOL equivalent. Configurable per market at init.
+    pub const DEFAULT_REWARD_PER_CRANK: u64 = 1_000_000; // 0.001 SOL in lamports
+
+    /// Fee percentage diverted to keeper fund top-up (in bps).
+    pub const KEEPER_FEE_TOPUP_BPS: u64 = 500; // 5% of fees
+
+    /// PDA seed prefix.
+    pub const KEEPER_FUND_SEED: &[u8] = b"keeper_fund";
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Pod, Zeroable)]
+    pub struct KeeperFundState {
+        pub magic: u64,
+        pub bump: u8,
+        pub _pad: [u8; 7],
+        /// Current fund balance (base token lamports).
+        pub balance: u64,
+        /// Reward paid to crank caller per successful KeeperCrank.
+        pub reward_per_crank: u64,
+        /// Lifetime total rewards paid out.
+        pub total_rewarded: u64,
+        /// Lifetime total topped up from fees.
+        pub total_topped_up: u64,
+    }
+
+    // Compile-time size check
+    const _: [(); 48] = [(); KEEPER_FUND_STATE_LEN];
+
+    /// Compute the deposit split: (lp_amount, keeper_fund_amount).
+    /// keeper_fund_amount = deposit * split_bps / 10_000
+    /// lp_amount = deposit - keeper_fund_amount (remainder, avoids rounding loss)
+    ///
+    /// Invariant: lp_amount + keeper_fund_amount == deposit (exact).
+    pub fn split_deposit(deposit: u64, split_bps: u64) -> (u64, u64) {
+        let capped_bps = split_bps.min(10_000);
+        let keeper_amount = deposit.saturating_mul(capped_bps) / 10_000;
+        let lp_amount = deposit.saturating_sub(keeper_amount);
+        (lp_amount, keeper_amount)
+    }
+
+    /// Pay crank reward from fund. Returns (new_balance, actual_reward).
+    /// If balance < reward_per_crank, pays the remaining balance (partial reward).
+    pub fn pay_crank_reward(balance: u64, reward_per_crank: u64) -> (u64, u64) {
+        let actual = balance.min(reward_per_crank);
+        (balance.saturating_sub(actual), actual)
+    }
+
+    /// Top up keeper fund from fees. Returns (new_balance, topped_up_amount).
+    pub fn topup_from_fees(balance: u64, fee_amount: u64, topup_bps: u64) -> (u64, u64) {
+        let topup = fee_amount.saturating_mul(topup_bps.min(10_000)) / 10_000;
+        (balance.saturating_add(topup), topup)
+    }
+
+    /// Check if fund is depleted (balance == 0 after paying reward).
+    pub fn is_depleted(balance: u64) -> bool {
+        balance == 0
+    }
+
+    /// Read KeeperFundState from account data.
+    pub fn read_state(data: &[u8]) -> Option<&KeeperFundState> {
+        if data.len() < KEEPER_FUND_STATE_LEN {
+            return None;
+        }
+        let state: &KeeperFundState = bytemuck::from_bytes(&data[..KEEPER_FUND_STATE_LEN]);
+        if state.magic != KEEPER_FUND_MAGIC {
+            return None;
+        }
+        Some(state)
+    }
+
+    /// Write KeeperFundState to account data.
+    pub fn write_state(data: &mut [u8], state: &KeeperFundState) {
+        data[..KEEPER_FUND_STATE_LEN].copy_from_slice(bytemuck::bytes_of(state));
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn test_split_deposit_conservation() {
+            // Exact conservation for various deposits
+            for deposit in [0, 1, 100, 999, 1_000_000, u64::MAX / 10_000] {
+                let (lp, fund) = split_deposit(deposit, KEEPER_FUND_SPLIT_BPS);
+                assert_eq!(lp + fund, deposit, "conservation failed for {}", deposit);
+            }
+        }
+
+        #[test]
+        fn test_split_deposit_ratios() {
+            let (lp, fund) = split_deposit(10_000, 3_000);
+            assert_eq!(fund, 3_000); // 30%
+            assert_eq!(lp, 7_000); // 70%
+        }
+
+        #[test]
+        fn test_split_deposit_zero() {
+            let (lp, fund) = split_deposit(0, 3_000);
+            assert_eq!(lp, 0);
+            assert_eq!(fund, 0);
+        }
+
+        #[test]
+        fn test_split_deposit_cap_bps() {
+            // split_bps > 10_000 capped to 10_000
+            let (lp, fund) = split_deposit(1_000, 20_000);
+            assert_eq!(fund, 1_000); // capped to 100%
+            assert_eq!(lp, 0);
+        }
+
+        #[test]
+        fn test_pay_crank_reward_normal() {
+            let (new_bal, reward) = pay_crank_reward(10_000, 1_000);
+            assert_eq!(new_bal, 9_000);
+            assert_eq!(reward, 1_000);
+        }
+
+        #[test]
+        fn test_pay_crank_reward_insufficient() {
+            let (new_bal, reward) = pay_crank_reward(500, 1_000);
+            assert_eq!(new_bal, 0);
+            assert_eq!(reward, 500); // partial
+        }
+
+        #[test]
+        fn test_pay_crank_reward_zero_balance() {
+            let (new_bal, reward) = pay_crank_reward(0, 1_000);
+            assert_eq!(new_bal, 0);
+            assert_eq!(reward, 0);
+        }
+
+        #[test]
+        fn test_topup_from_fees() {
+            let (new_bal, topped) = topup_from_fees(1_000, 10_000, 500);
+            assert_eq!(topped, 500); // 5% of 10_000
+            assert_eq!(new_bal, 1_500);
+        }
+
+        #[test]
+        fn test_state_roundtrip() {
+            let state = KeeperFundState {
+                magic: KEEPER_FUND_MAGIC,
+                bump: 254,
+                _pad: [0; 7],
+                balance: 12345,
+                reward_per_crank: 1000,
+                total_rewarded: 5000,
+                total_topped_up: 3000,
+            };
+            let mut buf = [0u8; KEEPER_FUND_STATE_LEN];
+            write_state(&mut buf, &state);
+            let read = read_state(&buf).unwrap();
+            assert_eq!(read.balance, 12345);
+            assert_eq!(read.bump, 254);
+            assert_eq!(read.total_rewarded, 5000);
+        }
+
+        #[test]
+        fn test_read_state_bad_magic() {
+            let mut buf = [0u8; KEEPER_FUND_STATE_LEN];
+            buf[0..8].copy_from_slice(&0xDEADBEEFu64.to_le_bytes());
+            assert!(read_state(&buf).is_none());
+        }
+    }
+}
+
+#[cfg(kani)]
+mod keeper_fund_kani {
+    use crate::keeper_fund::*;
+
+    /// Deposit split conserves total: lp + fund == deposit.
+    #[kani::proof]
+    fn proof_split_deposit_conservation() {
+        let deposit: u64 = kani::any();
+        let split_bps: u64 = kani::any();
+        kani::assume(split_bps <= 10_000);
+        // Only check deposits that won't overflow in multiply
+        kani::assume(deposit <= u64::MAX / 10_000);
+        let (lp, fund) = split_deposit(deposit, split_bps);
+        assert!(lp + fund == deposit, "split must conserve deposit");
+    }
+
+    /// Crank reward never exceeds balance.
+    #[kani::proof]
+    fn proof_reward_bounded() {
+        let balance: u64 = kani::any();
+        let reward_per_crank: u64 = kani::any();
+        let (new_bal, actual) = pay_crank_reward(balance, reward_per_crank);
+        assert!(actual <= balance, "reward must not exceed balance");
+        assert!(new_bal <= balance, "new balance must not increase");
+        assert!(new_bal + actual == balance, "conservation");
+    }
+
+    /// Fund balance monotonically decreases from rewards.
+    #[kani::proof]
+    fn proof_reward_monotone_decrease() {
+        let balance: u64 = kani::any();
+        let reward: u64 = kani::any();
+        let (new_bal, _) = pay_crank_reward(balance, reward);
+        assert!(new_bal <= balance);
+    }
+
+    /// Topup never decreases balance.
+    #[kani::proof]
+    fn proof_topup_monotone_increase() {
+        let balance: u64 = kani::any();
+        let fee: u64 = kani::any();
+        let bps: u64 = kani::any();
+        kani::assume(bps <= 10_000);
+        kani::assume(fee <= u64::MAX / 10_000);
+        let (new_bal, _) = topup_from_fees(balance, fee, bps);
+        assert!(new_bal >= balance);
+    }
+}
+
 // 9. mod processor
 pub mod processor {
     use crate::{
@@ -7605,7 +7843,89 @@ pub mod processor {
             vault_key: a_vault.key,
             a_clock: &accounts[5],
         };
-        init_market_write_slab(&mut data, &fields, *risk_params, &write_ctx)
+        init_market_write_slab(&mut data, &fields, *risk_params, &write_ctx)?;
+
+        // PERC-623: Optional keeper fund PDA initialization.
+        // accounts[9] = keeper_fund PDA (writable), accounts[10] = system_program
+        // The admin funds the keeper with SOL lamports (separate from the SPL token
+        // vault deposit). The keeper fund pays crank rewards in SOL.
+        // Backward compatible: callers passing only 9 accounts skip this.
+        if accounts.len() >= 11 {
+            let a_keeper_fund = &accounts[9];
+            let a_system_program = &accounts[10];
+            accounts::expect_writable(a_keeper_fund)?;
+
+            // Verify system program
+            if *a_system_program.key != solana_program::system_program::id() {
+                return Err(ProgramError::IncorrectProgramId);
+            }
+
+            // Verify PDA derivation
+            let (expected_pda, pda_bump) = Pubkey::find_program_address(
+                &[crate::keeper_fund::KEEPER_FUND_SEED, a_slab.key.as_ref()],
+                program_id,
+            );
+            if *a_keeper_fund.key != expected_pda {
+                return Err(ProgramError::InvalidSeeds);
+            }
+
+            // Create the keeper fund PDA account (program-owned, SOL-funded)
+            let rent = solana_program::rent::Rent::get()?;
+            let rent_lamports = rent.minimum_balance(crate::keeper_fund::KEEPER_FUND_STATE_LEN);
+            // The admin's excess lamports above rent become the keeper fund balance.
+            // Minimum keeper fund: DEFAULT_REWARD_PER_CRANK * 100 (enough for 100 cranks).
+            let min_fund = crate::keeper_fund::DEFAULT_REWARD_PER_CRANK
+                .saturating_mul(100)
+                .saturating_add(rent_lamports);
+
+            let bump_bytes = [pda_bump];
+            let signer_seeds: &[&[u8]] = &[
+                crate::keeper_fund::KEEPER_FUND_SEED,
+                a_slab.key.as_ref(),
+                &bump_bytes,
+            ];
+            solana_program::program::invoke_signed(
+                &solana_program::system_instruction::create_account(
+                    a_admin.key,
+                    &expected_pda,
+                    min_fund,
+                    crate::keeper_fund::KEEPER_FUND_STATE_LEN as u64,
+                    program_id,
+                ),
+                &[
+                    a_admin.clone(),
+                    a_keeper_fund.clone(),
+                    a_system_program.clone(),
+                ],
+                &[signer_seeds],
+            )?;
+
+            let fund_balance = min_fund.saturating_sub(rent_lamports);
+
+            // Initialize keeper fund state
+            let default_reward = crate::keeper_fund::DEFAULT_REWARD_PER_CRANK;
+            let state = crate::keeper_fund::KeeperFundState {
+                magic: crate::keeper_fund::KEEPER_FUND_MAGIC,
+                bump: pda_bump,
+                _pad: [0u8; 7],
+                balance: fund_balance,
+                reward_per_crank: default_reward,
+                total_rewarded: 0,
+                total_topped_up: 0,
+            };
+            let mut fund_data = a_keeper_fund
+                .try_borrow_mut_data()
+                .map_err(|_| ProgramError::AccountBorrowFailed)?;
+            crate::keeper_fund::write_state(&mut fund_data, &state);
+
+            msg!(
+                "PERC-623: KeeperFund initialized — balance={} reward_per_crank={}",
+                fund_balance,
+                default_reward
+            );
+        }
+
+        Ok(())
     }
 
     pub fn process_instruction<'a, 'b>(
@@ -8388,6 +8708,48 @@ pub mod processor {
                 // Debug: log lifetime counters (sol_log_64: tag, liqs, force, max_accounts, insurance)
                 msg!("CRANK_STATS");
                 sol_log_64(0xC8A4C, liqs, force, MAX_ACCOUNTS as u64, ins_low);
+
+                // PERC-623: Optional keeper fund reward — if 5th account is a valid
+                // KeeperFund PDA, pay crank reward to caller. Backward compatible:
+                // callers passing only 4 accounts skip this entirely.
+                if accounts.len() >= 5 {
+                    let a_keeper_fund = &accounts[4];
+                    if a_keeper_fund.is_writable {
+                        // Verify PDA derivation: seeds = ["keeper_fund", slab_key]
+                        let (expected_pda, _bump) = Pubkey::find_program_address(
+                            &[crate::keeper_fund::KEEPER_FUND_SEED, a_slab.key.as_ref()],
+                            program_id,
+                        );
+                        if *a_keeper_fund.key == expected_pda {
+                            let mut fund_data = a_keeper_fund
+                                .try_borrow_mut_data()
+                                .map_err(|_| ProgramError::AccountBorrowFailed)?;
+                            if let Some(fund_state) = crate::keeper_fund::read_state(&fund_data) {
+                                let (new_bal, reward) = crate::keeper_fund::pay_crank_reward(
+                                    fund_state.balance,
+                                    fund_state.reward_per_crank,
+                                );
+                                if reward > 0 {
+                                    let mut new_state = *fund_state;
+                                    new_state.balance = new_bal;
+                                    new_state.total_rewarded =
+                                        new_state.total_rewarded.saturating_add(reward);
+                                    crate::keeper_fund::write_state(&mut fund_data, &new_state);
+
+                                    // Transfer lamports from KeeperFund PDA to caller
+                                    **a_keeper_fund.try_borrow_mut_lamports()? -= reward;
+                                    **a_caller.try_borrow_mut_lamports()? += reward;
+
+                                    // If fund depleted, market auto-pause
+                                    if crate::keeper_fund::is_depleted(new_bal) {
+                                        state::set_paused(&mut data, true);
+                                        msg!("KEEPER_FUND_DEPLETED: market paused");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
             Instruction::TradeNoCpi {
                 lp_idx,
@@ -13243,6 +13605,69 @@ pub mod processor {
                         clock.slot
                     );
                 }
+            }
+
+            // PERC-623: TopUpKeeperFund — anyone can add lamports to a market's
+            // keeper fund PDA. Permissionless (no admin check).
+            Instruction::TopUpKeeperFund { amount } => {
+                // accounts: [0] funder (signer), [1] slab (writable), [2] keeper_fund PDA (writable)
+                accounts::expect_len(accounts, 3)?;
+                let a_funder = &accounts[0];
+                let a_slab = &accounts[1];
+                let a_keeper_fund = &accounts[2];
+                accounts::expect_signer(a_funder)?;
+                accounts::expect_writable(a_slab)?;
+                accounts::expect_writable(a_keeper_fund)?;
+
+                // Verify slab is a valid program-owned slab
+                {
+                    let slab_data = state::slab_data_mut(a_slab)?;
+                    slab_guard(program_id, a_slab, &slab_data)?;
+                    require_initialized(&slab_data)?;
+                }
+
+                // Verify keeper_fund PDA derivation
+                let (expected_pda, _bump) = Pubkey::find_program_address(
+                    &[crate::keeper_fund::KEEPER_FUND_SEED, a_slab.key.as_ref()],
+                    program_id,
+                );
+                if *a_keeper_fund.key != expected_pda {
+                    return Err(ProgramError::InvalidSeeds);
+                }
+
+                if amount == 0 {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+
+                // Transfer lamports from funder to keeper fund PDA
+                **a_funder.try_borrow_mut_lamports()? -= amount;
+                **a_keeper_fund.try_borrow_mut_lamports()? += amount;
+
+                // Update keeper fund state
+                let mut fund_data = a_keeper_fund
+                    .try_borrow_mut_data()
+                    .map_err(|_| ProgramError::AccountBorrowFailed)?;
+
+                if let Some(fund_state) = crate::keeper_fund::read_state(&fund_data) {
+                    let mut new_state = *fund_state;
+                    new_state.balance = new_state.balance.saturating_add(amount);
+                    new_state.total_topped_up = new_state.total_topped_up.saturating_add(amount);
+                    crate::keeper_fund::write_state(&mut fund_data, &new_state);
+
+                    // If market was auto-paused due to depletion, unpause it
+                    if !crate::keeper_fund::is_depleted(new_state.balance) {
+                        drop(fund_data);
+                        let mut slab_data = state::slab_data_mut(a_slab)?;
+                        if state::read_flags(&slab_data) & state::FLAG_PAUSED != 0 {
+                            state::set_paused(&mut slab_data, false);
+                            msg!("KEEPER_FUND_TOPPED_UP: market unpaused");
+                        }
+                    }
+                } else {
+                    return Err(ProgramError::InvalidAccountData);
+                }
+
+                msg!("TopUpKeeperFund: amount={}", amount);
             }
 
             // Defense-in-depth: if a future tag routes here by mistake,
