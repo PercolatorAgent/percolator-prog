@@ -4672,8 +4672,9 @@ fn nightly_fee_monotone_in_bps() {
 // =============================================================================
 
 /// Prove: single deposit dust conservation holds exactly.
+/// SAT-hard: symbolic u64×u128 multiplication in conservation check.
 #[kani::proof]
-fn kani_dust_single_deposit_conservation() {
+fn nightly_dust_single_deposit_conservation() {
     let amount: u64 = kani::any();
     let scale: u32 = kani::any();
     kani::assume(scale > 0);
@@ -4690,8 +4691,9 @@ fn kani_dust_single_deposit_conservation() {
 }
 
 /// Prove: two deposits with same scale conserve total value.
+/// SAT-hard: three-variable symbolic u128 multiplication (1411s in CI). Moved to nightly.
 #[kani::proof]
-fn kani_dust_two_deposits_conservation() {
+fn nightly_dust_two_deposits_conservation() {
     let a1: u64 = kani::any();
     let a2: u64 = kani::any();
     let scale: u32 = kani::any();
@@ -5472,7 +5474,7 @@ fn nightly_skew_adjusted_cap_never_exceeds_base_cap() {
 ///
 /// This guarantees LP yield never decreases as utilization increases.
 #[kani::proof]
-fn proof_fee_mult_monotonically_increases_with_utilization() {
+fn nightly_fee_mult_monotonically_increases_with_utilization() {
     let u1: u64 = kani::any();
     let u2: u64 = kani::any();
     kani::assume(u1 <= 10_000);
@@ -5756,9 +5758,11 @@ fn proof_loyalty_mult_never_exceeds_max_tier_strong() {
 }
 
 /// Prove: loyalty multiplier applies only to fee income (principal unchanged).
+/// Renamed to nightly_ — symbolic u64 kani::any() for delta_epochs (range 0..1_000_000)
+/// is SAT-hard in CBMC; proof ran >35min in PR CI (Thread 0 timeout in run 22878313887).
 #[cfg(kani)]
 #[kani::proof]
-fn proof_loyalty_applies_only_to_fee_income() {
+fn nightly_loyalty_applies_only_to_fee_income() {
     use percolator_prog::lp_vault::apply_loyalty_mult;
 
     let fee: u64 = kani::any();
@@ -5852,7 +5856,7 @@ fn proof_challenge_window_strictly_enforced() {
 /// Prove: oracle proof slot within bounds.
 #[cfg(kani)]
 #[kani::proof]
-fn proof_oracle_proof_slot_within_bounds() {
+fn nightly_oracle_slot_within_bounds() {
     let pyth_proof_slot: u64 = kani::any();
     let resolved_slot: u64 = kani::any();
 
@@ -5874,7 +5878,7 @@ fn proof_oracle_proof_slot_within_bounds() {
 /// Prove: LP collateral value bounded by vault TVL.
 #[cfg(kani)]
 #[kani::proof]
-fn proof_lp_collateral_value_bounded_by_vault_tvl() {
+fn nightly_lp_collateral_value_bounded_by_vault_tvl() {
     use percolator_prog::lp_collateral::lp_token_value;
 
     let lp_amount: u64 = kani::any();
@@ -5900,7 +5904,7 @@ fn proof_lp_collateral_value_bounded_by_vault_tvl() {
 /// Prove: liquidation triggers on TVL drop.
 #[cfg(kani)]
 #[kani::proof]
-fn proof_lp_collateral_liquidation_triggers_on_tvl_drop() {
+fn nightly_lp_collateral_liquidation_triggers_on_tvl_drop() {
     use percolator_prog::lp_collateral::tvl_drawdown_exceeded;
 
     let old_tvl: u64 = kani::any();
