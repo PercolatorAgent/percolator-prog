@@ -2466,9 +2466,100 @@ pub mod processor {
         zc,
     };
     use percolator::{
-        RiskEngine, MAX_ACCOUNTS,
+        RiskEngine, RiskError, MAX_ACCOUNTS,
     };
     use percolator::wide_math::I256;
+
+    /// Result of a successful trade execution from the matching engine
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct TradeExecution {
+        /// Actual execution price (may differ from oracle/requested price)
+        pub price: u64,
+        /// Actual executed size (may be partial fill)
+        pub size: i128,
+    }
+
+    /// Trait for pluggable matching engines
+    pub trait MatchingEngine {
+        fn execute_match(
+            &self,
+            lp_program: &[u8; 32],
+            lp_context: &[u8; 32],
+            lp_account_id: u64,
+            oracle_price: u64,
+            size: i128,
+        ) -> Result<TradeExecution, RiskError>;
+    }
+
+    /// No-op matching engine (for testing/TradeNoCpi)
+    pub struct NoOpMatcher;
+
+    impl MatchingEngine for NoOpMatcher {
+        fn execute_match(
+            &self,
+            _lp_program: &[u8; 32],
+            _lp_context: &[u8; 32],
+            _lp_account_id: u64,
+            oracle_price: u64,
+            size: i128,
+        ) -> Result<TradeExecution, RiskError> {
+            Ok(TradeExecution {
+                price: oracle_price,
+                size,
+            })
+        }
+    }
+
+    struct CpiMatcher {
+        exec_price: u64,
+        exec_size: i128,
+    }
+
+    impl MatchingEngine for CpiMatcher {
+        fn execute_match(
+            &self,
+            _lp_program: &[u8; 32],
+            _lp_context: &[u8; 32],
+            _lp_account_id: u64,
+            _oracle_price: u64,
+            _size: i128,
+        ) -> Result<TradeExecution, RiskError> {
+            Ok(TradeExecution {
+                price: self.exec_price,
+                size: self.exec_size,
+            })
+        }
+    }
+
+    /// Execute a trade via a matching engine.
+    /// `size` is the user's requested position change (positive = user goes long).
+    fn execute_trade_with_matcher<M: MatchingEngine>(
+        engine: &mut RiskEngine,
+        matcher: &M,
+        lp_idx: u16,
+        user_idx: u16,
+        now_slot: u64,
+        oracle_price: u64,
+        size: i128,
+    ) -> Result<(), RiskError> {
+        let lp = &engine.accounts[lp_idx as usize];
+        let exec = matcher.execute_match(
+            &lp.matcher_program,
+            &lp.matcher_context,
+            lp.account_id,
+            oracle_price,
+            size,
+        )?;
+        engine.execute_trade(
+            user_idx,
+            lp_idx,
+            oracle_price,
+            now_slot,
+            I256::from_i128(exec.size),
+            exec.price,
+        )
+    }
+
     use solana_program::instruction::{AccountMeta, Instruction as SolInstruction};
     use solana_program::{
         account_info::AccountInfo,
@@ -3401,9 +3492,9 @@ pub mod processor {
                     msg!("CU_CHECKPOINT: trade_nocpi_execute_start");
                     sol_log_compute_units();
                 }
-                engine
-                    .execute_trade(user_idx, lp_idx, price, clock.slot, I256::from_i128(size), price)
-                    .map_err(map_risk_error)?;
+                execute_trade_with_matcher(
+                    engine, &NoOpMatcher, lp_idx, user_idx, clock.slot, price, size,
+                ).map_err(map_risk_error)?;
                 #[cfg(feature = "cu-audit")]
                 {
                     msg!("CU_CHECKPOINT: trade_nocpi_execute_end");
@@ -3606,9 +3697,13 @@ pub mod processor {
                         msg!("CU_CHECKPOINT: trade_cpi_execute_start");
                         sol_log_compute_units();
                     }
-                    engine
-                        .execute_trade(user_idx, lp_idx, price, clock.slot, I256::from_i128(trade_size), exec_price)
-                        .map_err(map_risk_error)?;
+                    let matcher = CpiMatcher {
+                        exec_price,
+                        exec_size: trade_size,
+                    };
+                    execute_trade_with_matcher(
+                        engine, &matcher, lp_idx, user_idx, clock.slot, price, size,
+                    ).map_err(map_risk_error)?;
                     #[cfg(feature = "cu-audit")]
                     {
                         msg!("CU_CHECKPOINT: trade_cpi_execute_end");
@@ -4648,5 +4743,8 @@ pub mod entrypoint {
 pub mod risk {
     pub use percolator::{
         RiskEngine, RiskError, RiskParams,
+    };
+    pub use crate::processor::{
+        MatchingEngine, NoOpMatcher, TradeExecution,
     };
 }
