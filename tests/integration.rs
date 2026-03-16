@@ -19776,9 +19776,9 @@ fn test_attack_trade_zero_size() {
     assert_eq!(pos_after, 0, "Position changed despite failed zero trade!");
 }
 
-/// ATTACK: Force-realize mode closes positions during crank.
-/// When insurance <= threshold, crank enters force-realize mode.
-/// Verify it correctly closes positions without creating value.
+/// In spec v10.5, there is no force-realize mode. Low insurance does NOT
+/// trigger position force-close. Positions remain open regardless of
+/// insurance level. The crank only processes funding/settlement.
 #[test]
 fn test_attack_force_realize_closes_positions_safely() {
     program_path();
@@ -19794,7 +19794,7 @@ fn test_attack_force_realize_closes_positions_safely() {
     let user_idx = env.init_user(&user);
     env.deposit(&user, user_idx, 5_000_000_000);
 
-    // DO NOT top up insurance - force-realize mode is active (insurance=0 <= threshold=0)
+    // No insurance topped up
     env.crank();
 
     // Open position
@@ -19807,27 +19807,27 @@ fn test_attack_force_realize_closes_positions_safely() {
         TokenAccount::unpack(&vault_data).unwrap().amount
     };
 
-    // Crank - should force-realize the positions
+    // Crank — per spec v10.5, no force-realize (positions stay open)
     env.crank();
 
-    // After force-realize, positions should be zero
+    // Positions should remain open (no force-realize in v10.5)
     let user_pos = env.read_account_position(user_idx);
     let lp_pos = env.read_account_position(lp_idx);
-    assert_eq!(
+    assert_ne!(
         user_pos, 0,
-        "User position should be force-closed: {}",
+        "User position should remain open (no force-realize in v10.5): {}",
         user_pos
     );
-    assert_eq!(lp_pos, 0, "LP position should be force-closed: {}", lp_pos);
+    assert_ne!(lp_pos, 0, "LP position should remain open (no force-realize in v10.5): {}", lp_pos);
 
-    // SPL vault should be unchanged (force-realize doesn't move tokens)
+    // SPL vault unchanged (crank doesn't move tokens)
     let vault_after = {
         let vault_data = env.svm.get_account(&env.vault).unwrap().data;
         TokenAccount::unpack(&vault_data).unwrap().amount
     };
     assert_eq!(
         vault_before, vault_after,
-        "ATTACK: Force-realize changed vault balance! before={} after={}",
+        "Crank should not change vault balance: before={} after={}",
         vault_before, vault_after
     );
 }
