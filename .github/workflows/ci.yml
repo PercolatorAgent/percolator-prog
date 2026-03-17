@@ -24,6 +24,8 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        with:
+          prefix-key: "v2-ubuntu"
       - name: Build (lib)
         run: cargo build --lib --verbose
       - name: Build (devnet)
@@ -44,6 +46,8 @@ jobs:
           toolchain: stable
           components: clippy
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        with:
+          prefix-key: "v2-ubuntu"
       - name: Clippy
         run: cargo clippy --lib -- -W clippy::all
 
