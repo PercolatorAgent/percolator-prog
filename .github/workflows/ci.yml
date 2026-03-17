@@ -16,7 +16,7 @@ env:
 
 jobs:
   build:
-    runs-on: blacksmith-2vcpu-ubuntu-22.04
+    runs-on: ubuntu-22.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -24,6 +24,8 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        with:
+          prefix-key: "v2-ubuntu"
       - name: Build (lib)
         run: cargo build --lib --verbose
       - name: Build (devnet)
@@ -35,7 +37,7 @@ jobs:
       # Kani proofs run locally via `cargo kani` — not in CI.
 
   clippy:
-    runs-on: blacksmith-2vcpu-ubuntu-22.04
+    runs-on: ubuntu-22.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -44,11 +46,13 @@ jobs:
           toolchain: stable
           components: clippy
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        with:
+          prefix-key: "v2-ubuntu"
       - name: Clippy
         run: cargo clippy --lib -- -W clippy::all
 
   fmt:
-    runs-on: blacksmith-2vcpu-ubuntu-22.04
+    runs-on: ubuntu-22.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
