@@ -16198,12 +16198,12 @@ pub mod processor {
             }
 
             // SetPendingSettlement — keeper sets pending_settlement=1 before a funding transfer.
-            // Permissioned: only the slab admin or an authorized keeper can call this.
-            // For simplicity, we accept any signer (permissionless flag setting).
+            // Permissioned: only the slab admin (authorized keeper) can call this.
+            // GH#1475: without this guard any signer could grief position transfers (DoS).
             //
             // Accounts:
-            //   [0] keeper (signer)
-            //   [1] slab (read — for PDA verification)
+            //   [0] keeper / admin (signer)
+            //   [1] slab (read — for PDA verification + admin check)
             //   [2] position_nft PDA (writable)
             Instruction::SetPendingSettlement { user_idx } => {
                 accounts::expect_len(accounts, 3)?;
@@ -16213,6 +16213,17 @@ pub mod processor {
 
                 accounts::expect_signer(a_keeper)?;
                 accounts::expect_writable(a_nft_pda)?;
+
+                // GH#1475: keeper allowlist guard — restrict to slab admin only.
+                {
+                    let slab_data = a_slab
+                        .try_borrow_data()
+                        .map_err(|_| ProgramError::AccountBorrowFailed)?;
+                    slab_guard(program_id, a_slab, &slab_data)?;
+                    require_initialized(&slab_data)?;
+                    let header = state::read_header(&slab_data);
+                    require_admin(header.admin, a_keeper.key)?;
+                }
 
                 // Verify NFT PDA key
                 let (expected_nft_pda, _) =
@@ -16246,10 +16257,12 @@ pub mod processor {
             }
 
             // ClearPendingSettlement — keeper clears pending_settlement=0 after KeeperCrank.
+            // Permissioned: only the slab admin (authorized keeper) can call this.
+            // GH#1475: without this guard any signer could grief position transfers (DoS).
             //
             // Accounts:
-            //   [0] keeper (signer)
-            //   [1] slab (read — for PDA verification)
+            //   [0] keeper / admin (signer)
+            //   [1] slab (read — for PDA verification + admin check)
             //   [2] position_nft PDA (writable)
             Instruction::ClearPendingSettlement { user_idx } => {
                 accounts::expect_len(accounts, 3)?;
@@ -16259,6 +16272,17 @@ pub mod processor {
 
                 accounts::expect_signer(a_keeper)?;
                 accounts::expect_writable(a_nft_pda)?;
+
+                // GH#1475: keeper allowlist guard — restrict to slab admin only.
+                {
+                    let slab_data = a_slab
+                        .try_borrow_data()
+                        .map_err(|_| ProgramError::AccountBorrowFailed)?;
+                    slab_guard(program_id, a_slab, &slab_data)?;
+                    require_initialized(&slab_data)?;
+                    let header = state::read_header(&slab_data);
+                    require_admin(header.admin, a_keeper.key)?;
+                }
 
                 // Verify NFT PDA key
                 let (expected_nft_pda, _) =
