@@ -2391,6 +2391,12 @@ pub mod ix {
         ///
         /// Accounts: [dest(signer,writable), slab(signer,writable)]
         ReclaimSlabRent,
+        /// PERC-608: Transfer position ownership. Called by percolator-nft TransferHook.
+        /// Changes account[user_idx].owner to new_owner.
+        TransferPositionOwnership {
+            user_idx: u16,
+            new_owner: [u8; 32],
+        },
         /// PERC-622: Advance oracle phase (permissionless crank).
         AdvanceOraclePhase,
 
@@ -2974,6 +2980,18 @@ pub mod ix {
                 }
                 TAG_CLOSE_STALE_SLAB => Ok(Instruction::CloseStaleSlabs),
                 TAG_RECLAIM_SLAB_RENT => Ok(Instruction::ReclaimSlabRent),
+                TAG_TRANSFER_POSITION_OWNERSHIP => {
+                    let user_idx = read_u16(&mut rest)?;
+                    let mut new_owner = [0u8; 32];
+                    if rest.len() < 32 {
+                        return Err(ProgramError::InvalidInstructionData);
+                    }
+                    new_owner.copy_from_slice(&rest[..32]);
+                    Ok(Instruction::TransferPositionOwnership {
+                        user_idx,
+                        new_owner,
+                    })
+                }
                 TAG_ADVANCE_ORACLE_PHASE => Ok(Instruction::AdvanceOraclePhase),
                 TAG_AUDIT_CRANK => Ok(Instruction::AuditCrank),
                 TAG_SET_OFFSET_PAIR => {
@@ -14592,6 +14610,129 @@ pub mod processor {
                     "ReclaimSlabRent: reclaimed {} lamports from uninitialised slab (size={})",
                     slab_lamports,
                     slab_len,
+                );
+            }
+
+            // ═══════════════════════════════════════════════════════════════
+            // PERC-608: Transfer Position Ownership (tag 64)
+            // Called by percolator-nft TransferHook via CPI.
+            // ═══════════════════════════════════════════════════════════════
+            Instruction::TransferPositionOwnership {
+                user_idx,
+                new_owner,
+            } => {
+                accounts::expect_len(accounts, 3)?;
+                let a_caller = &accounts[0]; // NFT program mint authority PDA (signer)
+                let a_slab = &accounts[1]; // slab (writable)
+                let a_nft_prog = &accounts[2]; // percolator-nft program (for PDA derivation)
+
+                accounts::expect_signer(a_caller)?;
+                accounts::expect_writable(a_slab)?;
+
+                // Slab must be owned by this program.
+                if a_slab.owner != program_id {
+                    return Err(ProgramError::IllegalOwner);
+                }
+
+                // Verify a_caller is the canonical mint_authority PDA derived from the NFT program.
+                // The NFT program derives: find_program_address(&[b"mint_authority"], nft_program_id)
+                let (expected_mint_auth, _) = solana_program::pubkey::Pubkey::find_program_address(
+                    &[b"mint_authority"],
+                    a_nft_prog.key,
+                );
+                if a_caller.key != &expected_mint_auth {
+                    solana_program::msg!(
+                        "TransferPositionOwnership rejected: caller {} is not the expected \
+                         mint_authority PDA {} for NFT program {}",
+                        a_caller.key,
+                        expected_mint_auth,
+                        a_nft_prog.key
+                    );
+                    return Err(ProgramError::InvalidArgument);
+                }
+
+                // Read slab header to get max_accounts.
+                let mut slab_data = a_slab.try_borrow_mut_data()?;
+                if slab_data.len() < 16 {
+                    return Err(ProgramError::AccountDataTooSmall);
+                }
+
+                // Verify magic.
+                let magic = u64::from_le_bytes(
+                    slab_data[0..8]
+                        .try_into()
+                        .map_err(|_| PercolatorError::InvalidMagic)?,
+                );
+                if magic != MAGIC {
+                    return Err(PercolatorError::InvalidMagic.into());
+                }
+
+                let max_accounts = u16::from_le_bytes(
+                    slab_data[8..10]
+                        .try_into()
+                        .map_err(|_| ProgramError::InvalidAccountData)?,
+                );
+
+                if user_idx >= max_accounts {
+                    return Err(ProgramError::InvalidArgument.into());
+                }
+
+                // Detect layout and find account offset.
+                // Account size is always 240 bytes (repr(C) size_of::<Account>()).
+                // Layout variants differ only in bitmap_off:
+                //   V0  (large devnet slab):  bitmap_off=608,  determined by data size
+                //   V1D (small/medium slab):  bitmap_off=1048, determined by data size
+                // We compute the expected slab sizes and pick the matching layout.
+                // Fallback: if neither matches, use V1D (smaller, more common on devnet).
+                const ACCT_SIZE: usize = 240;
+                const V0_BITMAP_OFF: usize = 608;
+                const V1D_BITMAP_OFF: usize = 1048;
+
+                let bitmap_bytes = ((max_accounts as usize) + 7) / 8;
+                let v0_accounts_off = V0_BITMAP_OFF + bitmap_bytes;
+                let v1d_accounts_off = V1D_BITMAP_OFF + bitmap_bytes;
+
+                let v0_total = v0_accounts_off + (max_accounts as usize) * ACCT_SIZE;
+                let v1d_total = v1d_accounts_off + (max_accounts as usize) * ACCT_SIZE;
+
+                // Choose layout by matching total slab size (±8 bytes for alignment padding).
+                let (bitmap_off, accounts_off) =
+                    if slab_data.len() >= v0_total && slab_data.len() <= v0_total + 8 {
+                        (V0_BITMAP_OFF, v0_accounts_off)
+                    } else if slab_data.len() >= v1d_total && slab_data.len() <= v1d_total + 16 {
+                        (V1D_BITMAP_OFF, v1d_accounts_off)
+                    } else {
+                        // Unknown layout — use V1D as best-effort fallback.
+                        (V1D_BITMAP_OFF, v1d_accounts_off)
+                    };
+
+                let acct_off = accounts_off + (user_idx as usize) * ACCT_SIZE;
+
+                // Verify slot is allocated (bitmap bit set).
+                let byte_idx = bitmap_off + (user_idx as usize) / 8;
+                let bit_idx = (user_idx as usize) % 8;
+                if byte_idx >= slab_data.len() || (slab_data[byte_idx] & (1 << bit_idx)) == 0 {
+                    return Err(ProgramError::InvalidArgument.into());
+                }
+
+                // Account.owner is at offset 184 within the account slot (repr(C) layout).
+                // Layout: account_id(8) + capital(16) + kind(4) + pnl(16) + reserved_pnl(8)
+                //       + warmup_started_at_slot(8) + warmup_slope_per_step(16)
+                //       + position_size(16) + entry_price(8) + funding_index(16)
+                //       + matcher_program(32) + matcher_context(32) + owner(32) = 184
+                const ACCT_OWNER_OFF: usize = 184;
+                let owner_off = acct_off + ACCT_OWNER_OFF;
+                if owner_off + 32 > slab_data.len() {
+                    return Err(ProgramError::AccountDataTooSmall);
+                }
+
+                // Write new owner.
+                slab_data[owner_off..owner_off + 32].copy_from_slice(&new_owner);
+
+                msg!(
+                    "TransferPositionOwnership: idx={}, new_owner={}",
+                    user_idx,
+                    Pubkey::new_from_array(new_owner),
                 );
             }
 
