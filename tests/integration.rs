@@ -597,13 +597,15 @@ impl TestEnv {
     }
 
     fn set_slot(&mut self, slot: u64) {
+        // Offset by 100 to ensure monotonicity with init_market (runs at slot 100)
+        let effective_slot = slot + 100;
         self.svm.set_sysvar(&Clock {
-            slot,
-            unix_timestamp: slot as i64,
+            slot: effective_slot,
+            unix_timestamp: effective_slot as i64,
             ..Clock::default()
         });
         // Update oracle publish_time to match
-        let pyth_data = make_pyth_data(&TEST_FEED_ID, 138_000_000, -6, 1, slot as i64);
+        let pyth_data = make_pyth_data(&TEST_FEED_ID, 138_000_000, -6, 1, effective_slot as i64);
         self.svm
             .set_account(
                 self.pyth_index,
@@ -632,13 +634,14 @@ impl TestEnv {
 
     /// Set slot and update oracle to a specific price
     fn set_slot_and_price(&mut self, slot: u64, price_e6: i64) {
+        let effective_slot = slot + 100;
         self.svm.set_sysvar(&Clock {
-            slot,
-            unix_timestamp: slot as i64,
+            slot: effective_slot,
+            unix_timestamp: effective_slot as i64,
             ..Clock::default()
         });
         // Update oracle with new price and publish_time
-        let pyth_data = make_pyth_data(&TEST_FEED_ID, price_e6, -6, 1, slot as i64);
+        let pyth_data = make_pyth_data(&TEST_FEED_ID, price_e6, -6, 1, effective_slot as i64);
         self.svm
             .set_account(
                 self.pyth_index,
@@ -4819,9 +4822,10 @@ impl TradeCpiTestEnv {
     }
 
     fn set_slot(&mut self, slot: u64) {
+        let effective_slot = slot + 100;
         self.svm.set_sysvar(&Clock {
-            slot,
-            unix_timestamp: slot as i64,
+            slot: effective_slot,
+            unix_timestamp: effective_slot as i64,
             ..Clock::default()
         });
     }
