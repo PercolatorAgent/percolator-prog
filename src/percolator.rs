@@ -1511,6 +1511,8 @@ pub mod ix {
             liquidation_buffer_bps,
             min_liquidation_abs,
             min_initial_deposit: U128::ZERO,
+            min_nonzero_mm_req: 0u128,
+            min_nonzero_im_req: 0u128,
         };
         Ok((params, insurance_floor))
     }
