@@ -4133,7 +4133,11 @@ pub mod state {
     /// 0 = never observed (pool depth not yet recorded).
     #[inline]
     pub fn get_last_dex_liquidity_k(config: &MarketConfig) -> u32 {
-        u32::from_le_bytes(config._orphan_pad[2..6].try_into().unwrap_or([0u8; 4]))
+        u32::from_le_bytes(
+            config._orphan_pad[2..6]
+                .try_into()
+                .expect("_orphan_pad[2..6] is exactly 4 bytes"),
+        )
     }
 
     /// Write the last observed DEX quote liquidity into `_orphan_pad[2..6]`.
@@ -12728,7 +12732,7 @@ pub mod processor {
                 // Even with the 25-slot cooldown, if both instructions run in the same
                 // transaction (same block), the cooldown offers no protection.
                 //
-                // Defence: solana_program::program::get_stack_height() returns 1 for
+                // Defence: solana_program::instruction::get_stack_height() returns 1 for
                 // top-level instructions and >1 for CPI calls. Reject anything > 1.
                 // This is an on-chain, consensus-level check — cannot be bypassed.
                 //

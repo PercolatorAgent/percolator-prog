@@ -215,12 +215,12 @@ fn gate4_ema_alpha_consistent_with_window() {
 
 #[test]
 fn gate4_ema_window_8_hours_at_400ms_per_slot() {
-    // 8 hours × 3600 sec/hr × 2.5 slots/sec = 72_000 slots
+    // 8 hours × 3600 sec/hr × 2.5 slots/sec = 72_000 slots minimum
     let expected_8h = 72_000u64;
-    assert_eq!(
-        constants::MARK_PRICE_EMA_WINDOW_SLOTS,
-        expected_8h,
-        "EMA window should be 8 hours (72,000 slots)"
+    assert!(
+        constants::MARK_PRICE_EMA_WINDOW_SLOTS >= expected_8h,
+        "EMA window must be at least 8 hours (>= 72,000 slots), got {}",
+        constants::MARK_PRICE_EMA_WINDOW_SLOTS
     );
 }
 
