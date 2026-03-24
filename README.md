@@ -321,7 +321,7 @@ Engine-specific invariants (conservation, warmup, liquidation properties, etc.) 
 - **Integration tests**: 454 (LiteSVM with production BPF binaries)
 - **Unit tests**: 28
 - **Alignment tests**: 8
-- **Kani proofs**: 111
+- **Kani proofs**: 113
 - **CU benchmark**: 1 (worst case 461K CU, 32.9% of the 1.4M limit, with two-phase crank)
 
 ---
