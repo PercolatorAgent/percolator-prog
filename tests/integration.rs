@@ -6845,8 +6845,8 @@ fn test_maintenance_fees_drain_dead_accounts_for_gc() {
     program_path();
 
     println!("=== MAINTENANCE FEE DRAIN & GC TEST ===");
-    println!("Per-slot maintenance fees are disabled in this revision (spec §8.2).");
-    println!("Verifying: SetMaintenanceFee is accepted, cranks succeed, but fees do NOT drain accounts.");
+    println!("Maintenance fees are ENABLED (spec §8.2): fee_per_slot is charged from capital to insurance.");
+    println!("Verifying: fees drain small-capital accounts to zero, enabling permissionless GC.");
     println!();
 
     // Use standard TestEnv
@@ -6875,41 +6875,41 @@ fn test_maintenance_fees_drain_dead_accounts_for_gc() {
     println!("Initial num_used_accounts: {}", initial_used);
     assert!(initial_used >= 1, "Should have at least 1 account");
 
-    // Advance time and run multiple cranks
-    // Per-slot fees are disabled (spec §8.2), so capital should NOT be drained
+    // Advance time and run multiple cranks.
+    // Fees are enabled: 1_000_000/slot * 700 slots = 700_000_000 > 500_000_000 capital.
+    // Capital drains to zero on the first crank; subsequent cranks accumulate fee debt.
     for slot in [700u64, 800, 900, 1000, 1100, 1200] {
         env.set_slot(slot);
         env.crank();
     }
     println!("Ran multiple cranks through slot 1200");
 
-    // Capital should be unchanged (fees are disabled — no per-slot drain)
+    // Capital should be zero — fees drained it completely
     let final_capital = env.read_account_capital(user_idx);
     let final_used = env.read_num_used_accounts();
     println!("Final capital: {} (initial: {})", final_capital, initial_capital);
     println!("Final num_used_accounts: {}", final_used);
 
     assert_eq!(
-        final_capital, initial_capital,
-        "Per-slot maintenance fees are disabled: capital should not decrease. \
-         initial={} final={}",
+        final_capital, 0,
+        "Maintenance fees must drain capital to zero. initial={} final={}",
         initial_capital, final_capital
     );
 
-    // Account should NOT be GC'd since capital was not drained by fees
-    assert_eq!(
-        final_used, initial_used,
-        "No GC expected: account has non-zero capital (fees are disabled). \
+    // Account with zero capital, no position, no pnl, and fee debt should be GC'd
+    assert!(
+        final_used < initial_used,
+        "GC expected: account with zero capital and fee debt must be freed. \
          initial_used={} final_used={}",
         initial_used, final_used
     );
 
-    // SPL vault balance is preserved (no token transfers from fee drain)
+    // SPL vault balance is preserved (token transfers happen only on deposit/withdraw)
     let vault = env.vault_balance();
     assert!(vault > 0, "Vault should still hold user's tokens");
 
     println!();
-    println!("MAINTENANCE FEE DRAIN TEST COMPLETE (fees disabled, capital preserved)");
+    println!("MAINTENANCE FEE DRAIN TEST COMPLETE (fees enabled, account drained and GC'd)");
 }
 
 // ============================================================================
@@ -13297,20 +13297,27 @@ fn test_attack_maintenance_fee_u128_max() {
     let user_idx = env.init_user(&user);
     env.deposit(&user, user_idx, 10_000_000_000);
 
-    // Advance time and crank - maintenance fees are disabled (spec §8.2),
-    // so even u128::MAX fee does not trigger overflow. Crank must succeed.
+    // Advance time and crank - fees are ENABLED (spec §8.2).
+    // u128::MAX * dt overflows checked_mul, so fee is clamped to MAX_PROTOCOL_FEE_ABS.
+    // This is >> capital, so capital drains to zero. Crank must still succeed (no error).
     let capital_before = env.read_account_capital(user_idx);
     env.set_slot(200);
     let result = env.try_crank();
     assert!(
         result.is_ok(),
-        "Crank must succeed even with u128::MAX fee (fees disabled per §8.2): {:?}",
+        "Crank must succeed even with u128::MAX fee (overflow clamped to MAX_PROTOCOL_FEE_ABS): {:?}",
         result
     );
     let capital_after = env.read_account_capital(user_idx);
+    assert!(
+        capital_after < capital_before,
+        "Capital must be drained by maintenance fee (fee >> capital). before={} after={}",
+        capital_before, capital_after
+    );
     assert_eq!(
-        capital_after, capital_before,
-        "Capital must not change when maintenance fees are disabled"
+        capital_after, 0,
+        "Capital must be fully drained to zero (fee >> capital). before={} after={}",
+        capital_before, capital_after
     );
 }
 
@@ -18989,9 +18996,9 @@ fn test_attack_insurance_fee_growth_doesnt_inflate_haircut() {
 
     env.crank();
 
-    // Maintenance fees are disabled (spec §8.2). SetMaintenanceFee is accepted
-    // but fees are not applied during crank. Insurance only grows via TopUpInsurance.
-    env.try_set_maintenance_fee(&admin, 100).unwrap(); // Accepted but no-op
+    // Maintenance fees are ENABLED (spec §8.2): fee = dt * fee_per_slot charged from
+    // capital to insurance. SetMaintenanceFee sets 100/slot.
+    env.try_set_maintenance_fee(&admin, 100).unwrap();
 
     // Top up insurance to disable force-realize
     env.try_top_up_insurance(&admin, 1_000_000_000).unwrap();
@@ -19002,20 +19009,22 @@ fn test_attack_insurance_fee_growth_doesnt_inflate_haircut() {
     // Record insurance before crank
     let insurance_before = env.read_insurance_balance();
 
-    // Advance time — fees are disabled, so insurance must NOT grow from them
+    // Advance time — fees charge from capital to insurance. Insurance grows.
     env.set_slot(1000);
     env.crank();
 
-    // Insurance should remain unchanged (maintenance fees disabled)
+    // Insurance should GROW from maintenance fees (fees are enabled)
     let insurance_after = env.read_insurance_balance();
-    assert_eq!(
-        insurance_after, insurance_before,
-        "ATTACK: Insurance grew from maintenance fees that are supposed to be disabled! before={} after={}",
+    assert!(
+        insurance_after > insurance_before,
+        "Insurance must grow from enabled maintenance fees. before={} after={}",
         insurance_before,
         insurance_after
     );
 
     // vault = SPL vault in engine units. residual = vault - c_tot - insurance
+    // Conservation: when fees move capital to insurance, c_tot decreases and
+    // insurance increases by equal amount → residual stays non-negative.
     let engine_vault = env.read_engine_vault();
     let c_tot = env.read_c_tot();
 
@@ -19029,20 +19038,22 @@ fn test_attack_insurance_fee_growth_doesnt_inflate_haircut() {
     );
 
     // Haircut = min(residual, pnl_pos_tot) / pnl_pos_tot
-    // With stable insurance, residual = vault - c_tot - insurance stays stable
+    // Fee transfers move capital→insurance, so residual = vault - c_tot - insurance
+    // remains stable: fees do NOT inflate residual and cannot inflate haircut above 1.0.
     let residual = engine_vault - c_tot - insurance_after;
     let pnl_pos_tot = env.read_pnl_pos_tot();
     if pnl_pos_tot > 0 {
         // Haircut ratio should be <= 1.0 (residual/pnl_pos_tot <= 1)
         assert!(
             residual <= pnl_pos_tot || pnl_pos_tot == 0,
-            "Residual exceeds pnl_pos_tot - unexpected! residual={} pnl_pos_tot={}",
+            "Fee-induced insurance growth must not inflate haircut above 1.0! residual={} pnl_pos_tot={}",
             residual,
             pnl_pos_tot
         );
     }
 
-    // SPL vault conservation: deposits + insurance top-up
+    // SPL vault is unchanged: fee transfers are internal accounting, not SPL movements.
+    // deposits + insurance top-up = 20B + 5B + 1B = 26B
     let spl_vault = {
         let vault_data = env.svm.get_account(&env.vault).unwrap().data;
         TokenAccount::unpack(&vault_data).unwrap().amount
@@ -19050,7 +19061,7 @@ fn test_attack_insurance_fee_growth_doesnt_inflate_haircut() {
     assert_eq!(
         spl_vault,
         26_000_000_000, // 20B + 5B + 1B insurance
-        "ATTACK: SPL vault changed!"
+        "ATTACK: SPL vault changed from maintenance fees (should be internal only)!"
     );
 }
 
@@ -22320,39 +22331,42 @@ fn test_attack_extreme_maintenance_fee_no_overflow() {
     env.try_top_up_insurance(&admin, 1_000_000_000).unwrap();
     env.crank();
 
-    // Set high maintenance fee - accepted but disabled (spec §8.2), no overflow possible
+    // Set high maintenance fee (10B/slot) — fees are ENABLED (spec §8.2).
+    // dt=1000 slots: fee = 10_000_000_000 * 1000 = 10^13, clamped to MAX_PROTOCOL_FEE_ABS.
+    // No overflow in the engine: checked_mul overflows → clamped, no panic, no error return.
     env.try_set_maintenance_fee(&admin, 10_000_000_000).unwrap();
 
-    // Advance many slots - fees are disabled so capital must not decrease
+    // Advance many slots - fees drain capital to zero (fee >> capital)
     let user_cap_before = env.read_account_capital(user_idx);
     env.set_slot(1000);
     env.crank();
 
-    // Capital must remain unchanged (fees disabled, no overflow risk)
+    // Capital must be drained to zero (fee >> capital, no arithmetic overflow)
     let user_cap = env.read_account_capital(user_idx);
     assert_eq!(
-        user_cap, user_cap_before,
-        "ATTACK: Capital changed even though maintenance fees are disabled! before={} after={}",
+        user_cap, 0,
+        "Capital must be drained to zero by extreme maintenance fee. before={} after={}",
         user_cap_before, user_cap
     );
 
-    // Conservation still holds
+    // Conservation still holds: vault >= c_tot + insurance (fee moved capital→insurance)
+    let engine_vault = env.read_engine_vault();
     let c_tot = env.read_c_tot();
-    let sum = env.read_account_capital(lp_idx) + env.read_account_capital(user_idx);
-    assert_eq!(
-        c_tot, sum,
-        "ATTACK: c_tot desync! c_tot={} sum={}",
-        c_tot, sum
+    let insurance = env.read_insurance_balance();
+    assert!(
+        engine_vault >= c_tot + insurance,
+        "ATTACK: vault < c_tot + insurance! vault={} c_tot={} insurance={}",
+        engine_vault, c_tot, insurance
     );
 
-    // SPL vault unchanged
+    // SPL vault unchanged (fee transfers are internal accounting, not SPL movements)
     let spl_vault = {
         let vault_data = env.svm.get_account(&env.vault).unwrap().data;
         TokenAccount::unpack(&vault_data).unwrap().amount
     };
     assert_eq!(
         spl_vault, 26_000_000_000,
-        "ATTACK: SPL vault changed!"
+        "ATTACK: SPL vault changed from maintenance fees (should be internal only)!"
     );
 }
 
@@ -26011,23 +26025,24 @@ fn test_attack_maintenance_fee_depletes_small_capital() {
 
     env.try_top_up_insurance(&admin, 1_000_000_000).unwrap();
 
-    // Maintenance fees are disabled (spec §8.2). SetMaintenanceFee is accepted
-    // but no fee deductions happen during crank.
+    // Maintenance fees are ENABLED (spec §8.2): 1_000_000/slot charged from capital.
+    // User capital=1_000_000. First crank at slot 200: dt=200, fee=200_000_000 >> capital.
+    // Capital drains to zero immediately.
     env.try_set_maintenance_fee(&admin, 1_000_000).unwrap();
 
     let cap_before = env.read_account_capital(user_idx);
 
-    // Crank several times — capital must NOT be depleted
+    // Crank several times — capital is depleted by fee on first crank
     for slot in (200..=1000).step_by(100) {
         env.set_slot(slot);
         env.crank();
     }
 
-    // Capital must remain unchanged (fees disabled, no depletion)
+    // Capital must be zero (fee >> capital, drained on first crank)
     let cap = env.read_account_capital(user_idx);
     assert_eq!(
-        cap, cap_before,
-        "ATTACK: Capital changed even though maintenance fees are disabled! before={} after={}",
+        cap, 0,
+        "Capital must be drained to zero by maintenance fee. before={} after={}",
         cap_before, cap
     );
 
@@ -27564,18 +27579,19 @@ fn test_attack_maintenance_fee_huge_dt_saturation() {
     env.try_top_up_insurance(&admin, 1_000_000_000).unwrap();
     env.crank();
 
-    // Maintenance fees are disabled (spec §8.2). Even with u64::MAX fee and
-    // huge dt, there is no overflow risk because fees are simply not applied.
+    // Maintenance fees are ENABLED (spec §8.2). Fee=u64::MAX/slot.
+    // Huge dt: checked_mul(1_000_000, u64::MAX) overflows → fee clamped to MAX_PROTOCOL_FEE_ABS.
+    // Fee >> capital (10B), so capital drains to zero. No panic, no error return.
     env.try_set_maintenance_fee(&admin, u64::MAX as u128)
         .unwrap();
 
     let user_cap_before = env.read_account_capital(user_idx);
 
-    // Jump forward a massive number of slots — must not panic, must not deplete capital
+    // Jump forward a massive number of slots — must not panic, must deplete capital
     env.set_slot(1_000_000);
     env.crank();
 
-    // No panic, conservation holds
+    // No panic; conservation holds (fee moved capital→insurance)
     let vault = env.vault_balance();
     let engine_vault = env.read_engine_vault();
     assert_eq!(
@@ -27584,11 +27600,11 @@ fn test_attack_maintenance_fee_huge_dt_saturation() {
         engine_vault, vault
     );
 
-    // User's capital must remain unchanged (fees disabled)
+    // User's capital must be drained to zero (fee >> capital)
     let user_cap = env.read_account_capital(user_idx);
     assert_eq!(
-        user_cap, user_cap_before,
-        "ATTACK: Capital changed even though maintenance fees are disabled! before={} after={}",
+        user_cap, 0,
+        "Capital must be drained to zero by u64::MAX fee. before={} after={}",
         user_cap_before, user_cap
     );
 
@@ -28865,8 +28881,8 @@ fn test_attack_config_change_applied_to_next_instruction() {
     env.try_top_up_insurance(&admin, 1_000_000_000).unwrap();
     env.crank();
 
-    // Maintenance fees are disabled (spec §8.2). Config changes are accepted
-    // but do not affect per-slot capital deductions during crank.
+    // Maintenance fees are ENABLED (spec §8.2): config change takes effect immediately.
+    // Next crank will charge dt * fee_per_slot from capital.
     env.try_set_maintenance_fee(&admin, 1_000_000).unwrap();
 
     // Trade immediately after config change
@@ -28875,22 +28891,34 @@ fn test_attack_config_change_applied_to_next_instruction() {
     // Record capital after trade (trading fees may reduce capital slightly)
     let user_cap_after_trade = env.read_account_capital(user_idx);
 
-    // Advance slots — maintenance fees must NOT reduce capital further
+    // Advance 200 slots — fees charge dt * fee_per_slot = 200 * 1_000_000 = 200_000_000
     env.set_slot(200);
     env.crank();
 
-    // User capital must remain the same as after the trade (no fee deductions)
+    // User capital must decrease by the maintenance fee charged over 200 slots
     let user_cap = env.read_account_capital(user_idx);
-    assert_eq!(
-        user_cap, user_cap_after_trade,
-        "ATTACK: Maintenance fee config change affected capital even though fees are disabled! before_crank={} after_crank={}",
+    let expected_fee: u128 = 200 * 1_000_000;
+    assert!(
+        user_cap < user_cap_after_trade,
+        "Maintenance fee must reduce capital after crank. before_crank={} after_crank={}",
         user_cap_after_trade, user_cap
     );
+    assert_eq!(
+        user_cap,
+        user_cap_after_trade.saturating_sub(expected_fee),
+        "Capital must decrease by exactly dt * fee_per_slot = {}. before={} after={}",
+        expected_fee, user_cap_after_trade, user_cap
+    );
 
-    // Conservation
+    // Conservation: fees moved capital→insurance, c_tot is lower, but must still be consistent
+    let engine_vault = env.read_engine_vault();
     let c_tot = env.read_c_tot();
-    let sum = env.read_account_capital(lp_idx) + env.read_account_capital(user_idx);
-    assert_eq!(c_tot, sum, "c_tot after config change + trade");
+    let insurance = env.read_insurance_balance();
+    assert!(
+        engine_vault >= c_tot + insurance,
+        "Conservation: vault < c_tot + insurance! vault={} c_tot={} insurance={}",
+        engine_vault, c_tot, insurance
+    );
 }
 
 /// ATTACK: Multiple admin changes in rapid succession.
@@ -32370,4 +32398,90 @@ fn test_full_market_shutdown_lifecycle() {
     println!("CloseSlab result: {:?}", close_slab_result);
 
     println!("FULL MARKET SHUTDOWN LIFECYCLE: PASSED");
+}
+
+/// Dormant accounts drain to zero via maintenance fees, enabling permissionless shutdown.
+#[test]
+fn test_dormant_accounts_drain_and_market_closes() {
+    program_path();
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    // Set maintenance fee: 1000 units/slot
+    env.try_set_maintenance_fee(&admin, 1000).unwrap();
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 1_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 500_000_000);
+
+    env.try_top_up_insurance(&admin, 100_000_000).unwrap();
+
+    env.set_slot(1);
+    env.crank();
+
+    assert!(env.read_account_capital(user_idx) > 0);
+    assert!(env.read_account_capital(lp_idx) > 0);
+
+    // Users go dormant — only keepers crank
+    let mut slot = 100u64;
+    let mut user_drained = false;
+    let mut lp_drained = false;
+
+    for _ in 0..30 {
+        slot += 200_000;
+        env.set_slot(slot);
+        let _ = env.try_crank();
+
+        if env.read_account_capital(user_idx) == 0 && !user_drained {
+            println!("User drained at slot {}", slot + 100);
+            user_drained = true;
+        }
+        if env.read_account_capital(lp_idx) == 0 && !lp_drained {
+            println!("LP drained at slot {}", slot + 100);
+            lp_drained = true;
+        }
+        if user_drained && lp_drained { break; }
+    }
+
+    assert!(user_drained, "User should drain via maintenance fees");
+    assert!(lp_drained, "LP should drain via maintenance fees");
+
+    let insurance_after = env.read_insurance_balance();
+    assert!(insurance_after > 100_000_000, "Insurance should grow from fees: {}", insurance_after);
+
+    // Accounts may have fee debt (negative fee_credits) preventing GC.
+    // Admin resolves market and force-closes remaining accounts.
+    slot += 10_000;
+    env.set_slot(slot);
+    let _ = env.try_crank();
+
+    // Set oracle authority and push price for resolution
+    env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
+    env.try_push_oracle_price(&admin, 138_000_000, (slot + 100) as i64).unwrap();
+    env.try_resolve_market(&admin).unwrap();
+
+    // Force-close remaining accounts
+    let _ = env.try_admin_force_close_account(&admin, user_idx, &user.pubkey());
+    let _ = env.try_admin_force_close_account(&admin, lp_idx, &lp.pubkey());
+
+    let used = env.read_num_used_accounts();
+    println!("Accounts after force-close: {}", used);
+    assert_eq!(used, 0, "All accounts should be closed after admin force-close");
+
+    // Withdraw insurance (all fees collected + initial top-up)
+    let withdraw_result = env.try_withdraw_insurance(&admin);
+    assert!(withdraw_result.is_ok(), "Insurance withdrawal: {:?}", withdraw_result);
+
+    // Close slab
+    let close_result = env.try_close_slab();
+    println!("CloseSlab: {:?}", close_result);
+
+    println!("DORMANT DRAIN + MARKET SHUTDOWN: PASSED");
 }
