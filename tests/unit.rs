@@ -257,6 +257,9 @@ fn encode_init_market(fixture: &MarketFixture, crank_staleness: u64) -> Vec<u8> 
     encode_u128(0, &mut data);  // liquidation_fee_cap
     encode_u64(0, &mut data);   // liquidation_buffer_bps
     encode_u128(0, &mut data);  // min_liquidation_abs
+    encode_u16(0, &mut data); // insurance_withdraw_max_bps
+    encode_u64(0, &mut data); // insurance_withdraw_cooldown_slots
+    encode_u128(u128::MAX, &mut data); // max_insurance_floor_change_per_day
     data
 }
 
@@ -293,6 +296,9 @@ fn encode_init_market_invert(
     encode_u128(0, &mut data);   // liquidation_fee_cap
     encode_u64(0, &mut data);    // liquidation_buffer_bps
     encode_u128(0, &mut data);   // min_liquidation_abs
+    encode_u16(0, &mut data); // insurance_withdraw_max_bps
+    encode_u64(0, &mut data); // insurance_withdraw_cooldown_slots
+    encode_u128(u128::MAX, &mut data); // max_insurance_floor_change_per_day
     data
 }
 

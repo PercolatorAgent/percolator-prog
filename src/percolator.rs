@@ -4056,9 +4056,21 @@ pub mod processor {
                     return Err(PercolatorError::InvalidConfigParam.into());
                 }
 
-                // Rate-limit: max change per day (immutable cap)
-                if config.max_insurance_floor_change_per_day > 0 {
-                    let current_floor = config.last_insurance_floor_value;
+                // Read actual current insurance_floor from engine (not stale config
+                // baseline) to prevent bypass via auto-update drift.
+                let current_floor = {
+                    let engine = zc::engine_ref(&data)?;
+                    engine.params.insurance_floor.get()
+                };
+
+                // Rate-limit: max change per day (immutable cap).
+                // 0 = locked (no changes allowed after init).
+                if config.max_insurance_floor_change_per_day == 0 {
+                    if new_threshold != current_floor {
+                        return Err(PercolatorError::InvalidConfigParam.into());
+                    }
+                } else {
+                    let current_floor = current_floor; // shadow for clarity
                     let delta = if new_threshold > current_floor {
                         new_threshold - current_floor
                     } else {
@@ -4068,7 +4080,9 @@ pub mod processor {
                     // Compute allowed delta based on elapsed time
                     const SLOTS_PER_DAY: u64 = 216_000; // ~2.5 slots/sec * 86400
                     let elapsed = clock.slot.saturating_sub(config.last_insurance_floor_change_slot);
-                    let max_delta = if elapsed >= SLOTS_PER_DAY {
+                    let max_delta = if elapsed >= SLOTS_PER_DAY || elapsed == 0 {
+                        // Full daily budget if: enough time passed, OR same-slot
+                        // (first change after init, or idempotent re-set)
                         config.max_insurance_floor_change_per_day
                     } else {
                         // Pro-rate: max_change * elapsed / SLOTS_PER_DAY
@@ -4525,11 +4539,11 @@ pub mod processor {
                 slab_guard(program_id, a_slab, &data)?;
                 require_initialized(&data)?;
 
-                // Policy can be set on live or resolved markets.
-                // Live markets: enables rate-limited yield distribution.
-                // Resolved markets: enables post-resolution withdrawal.
-                if false {
-                    // Removed: resolution gate no longer required
+                // Policy writes oracle fields — only safe on resolved markets
+                // where the oracle is no longer needed. Live-market withdrawal
+                // limits use the dedicated MarketConfig fields instead.
+                if !state::is_resolved(&data) {
+                    return Err(ProgramError::InvalidAccountData);
                 }
 
                 let header = state::read_header(&data);
@@ -4579,8 +4593,16 @@ pub mod processor {
                 let mut data = state::slab_data_mut(a_slab)?;
                 slab_guard(program_id, a_slab, &data)?;
                 require_initialized(&data)?;
-                // Live-market withdrawals allowed (excess above insurance_floor).
-                // Resolved-market withdrawals also allowed (same path).
+
+                // If immutable insurance_withdraw_max_bps == 0, live-market
+                // withdrawals are disabled. Only resolved markets can withdraw.
+                let resolved = state::is_resolved(&data);
+                {
+                    let cfg = state::read_config(&data);
+                    if cfg.insurance_withdraw_max_bps == 0 && !resolved {
+                        return Err(PercolatorError::InvalidConfigParam.into());
+                    }
+                }
 
                 let header = state::read_header(&data);
                 let mut config = state::read_config(&data);
@@ -4659,7 +4681,7 @@ pub mod processor {
                     crate::units::base_to_units(policy_min_base, config.unit_scale);
                 let policy_min_units = policy_min_units_u64 as u128;
 
-                let resolved = state::is_resolved(&data);
+                // `resolved` already computed above
                 {
                     let engine = zc::engine_mut(&mut data)?;
                     if resolved {

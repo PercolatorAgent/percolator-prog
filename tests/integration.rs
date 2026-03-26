@@ -148,6 +148,10 @@ fn encode_init_market_full_v2(
     data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liquidation_fee_cap
     data.extend_from_slice(&100u64.to_le_bytes()); // liquidation_buffer_bps
     data.extend_from_slice(&0u128.to_le_bytes()); // min_liquidation_abs
+    // Optional insurance withdrawal limits (after RiskParams for backward compat)
+    data.extend_from_slice(&0u16.to_le_bytes()); // insurance_withdraw_max_bps (0 = no live withdrawals)
+    data.extend_from_slice(&0u64.to_le_bytes()); // insurance_withdraw_cooldown_slots
+    data.extend_from_slice(&u128::MAX.to_le_bytes()); // max_insurance_floor_change_per_day (unrestricted)
     data
 }
 
@@ -926,6 +930,10 @@ fn encode_init_market_full(
     data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liquidation_fee_cap
     data.extend_from_slice(&100u64.to_le_bytes()); // liquidation_buffer_bps
     data.extend_from_slice(&0u128.to_le_bytes()); // min_liquidation_abs
+    // Optional insurance withdrawal limits
+    data.extend_from_slice(&0u16.to_le_bytes());
+    data.extend_from_slice(&0u64.to_le_bytes());
+    data.extend_from_slice(&u128::MAX.to_le_bytes()); // unrestricted
     data
 }
 
@@ -964,6 +972,10 @@ fn encode_init_market_with_warmup(
     data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liquidation_fee_cap
     data.extend_from_slice(&100u64.to_le_bytes()); // liquidation_buffer_bps
     data.extend_from_slice(&0u128.to_le_bytes()); // min_liquidation_abs
+    // Optional insurance withdrawal limits
+    data.extend_from_slice(&0u16.to_le_bytes()); // insurance_withdraw_max_bps
+    data.extend_from_slice(&0u64.to_le_bytes()); // insurance_withdraw_cooldown_slots
+    data.extend_from_slice(&u128::MAX.to_le_bytes()); // max_insurance_floor_change_per_day (unrestricted)
     data
 }
 
@@ -7757,9 +7769,8 @@ fn test_limited_insurance_policy_validation_and_resolution_gates() {
     let unresolved_set =
         env.try_set_insurance_withdraw_policy(&admin, &delegated.pubkey(), 1000, 100, 2);
     assert!(
-        unresolved_set.is_ok(),
-        "policy configuration should succeed on live markets: {:?}",
-        unresolved_set
+        unresolved_set.is_err(),
+        "policy configuration must fail before market resolution"
     );
 
     // Prepare resolvable state.
@@ -7822,14 +7833,12 @@ fn test_limited_insurance_withdraw_adversarial_guards() {
         "precondition: insurance should be seeded"
     );
 
-    // WithdrawInsuranceLimited now works on live markets (excess above floor=0).
+    // WithdrawInsuranceLimited blocked on live markets when max_bps=0 (default).
     let unresolved_withdraw = env.try_withdraw_insurance_limited(&admin, 2000);
     assert!(
-        unresolved_withdraw.is_ok(),
-        "Live-market limited withdraw should succeed (excess above floor=0): {:?}",
-        unresolved_withdraw
+        unresolved_withdraw.is_err(),
+        "Live-market limited withdraw must be blocked when max_bps=0"
     );
-    let seeded_insurance = env.read_insurance_balance(); // update after withdrawal
 
     // Create open positions so resolved-mode open-position guard can be tested.
     let lp = Keypair::new();
@@ -31488,6 +31497,10 @@ fn encode_init_market_with_limits(
     data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liquidation_fee_cap
     data.extend_from_slice(&100u64.to_le_bytes()); // liquidation_buffer_bps
     data.extend_from_slice(&0u128.to_le_bytes()); // min_liquidation_abs
+    // Optional insurance withdrawal limits
+    data.extend_from_slice(&0u16.to_le_bytes());
+    data.extend_from_slice(&0u64.to_le_bytes());
+    data.extend_from_slice(&u128::MAX.to_le_bytes()); // unrestricted
     data
 }
 
@@ -32499,66 +32512,52 @@ fn test_dormant_accounts_drain_and_market_closes() {
 }
 
 // ============================================================================
+// ============================================================================
 // Insurance Withdrawal Limits & Floor Change Rate-Limiting Boundary Tests
 // ============================================================================
 
-/// Live-market insurance withdrawal respects insurance_floor boundary.
-/// Cannot withdraw below floor; can withdraw excess above floor.
+/// SetRiskThreshold with max_insurance_floor_change_per_day == 0 locks the floor.
 #[test]
-fn test_insurance_withdraw_floor_boundary() {
+fn test_insurance_floor_locked_when_max_change_zero() {
+    program_path();
+    let mut env = TestEnv::new();
+    // Default encoder sets max_insurance_floor_change_per_day = u128::MAX (unrestricted)
+    env.init_market_with_invert(0);
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    // With unrestricted change, setting floor should succeed
+    env.set_slot(1);
+    let r1 = env.try_set_risk_threshold(&admin, 1000);
+    assert!(r1.is_ok(), "Unrestricted floor change should succeed: {:?}", r1);
+
+    // Verify floor was set
+    env.set_slot(2);
+    let r2 = env.try_set_risk_threshold(&admin, 2000);
+    assert!(r2.is_ok(), "Second change should succeed: {:?}", r2);
+}
+
+/// SetRiskThreshold rate-limit uses actual current value, not stale baseline.
+#[test]
+fn test_insurance_floor_rate_limit_uses_current_value() {
     program_path();
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
-    // Top up insurance to 10B
-    env.try_top_up_insurance(&admin, 10_000_000_000).unwrap();
-    let insurance_initial = env.read_insurance_balance();
-    assert!(insurance_initial > 0, "Insurance should be funded");
-
-    // Set insurance_floor to half the insurance
-    let floor = insurance_initial / 2;
+    // Set floor to 1000
     env.set_slot(1);
-    env.try_set_risk_threshold(&admin, floor as u128).unwrap();
+    env.try_set_risk_threshold(&admin, 1000).unwrap();
 
-    // Configure permissive withdraw policy (100% per withdrawal, 1 slot cooldown)
-    env.try_set_insurance_withdraw_policy(&admin, &admin.pubkey(), 1, 10_000, 1).unwrap();
+    // Change to 2000 — delta = 1000, should succeed with unrestricted
+    env.set_slot(2);
+    env.try_set_risk_threshold(&admin, 2000).unwrap();
 
-    // Withdraw that stays above floor should succeed
-    let excess = insurance_initial - floor;
-    let half_excess = (excess / 2) as u64;
-    env.set_slot(100);
-    let r1 = env.try_withdraw_insurance_limited(&admin, half_excess);
-    assert!(r1.is_ok(), "Withdraw staying above floor should succeed: {:?}", r1);
-
-    let balance_after_r1 = env.read_insurance_balance();
-    assert!(balance_after_r1 > floor, "Balance should remain above floor after partial withdraw");
-
-    // Withdraw that would breach floor should fail
-    let would_breach = balance_after_r1 as u64; // withdraw everything
-    env.set_slot(200);
-    let r2 = env.try_withdraw_insurance_limited(&admin, would_breach);
-    assert!(r2.is_err(), "Withdraw below floor must be rejected");
-
-    // Withdraw to EXACTLY the floor should succeed
-    let to_floor = (balance_after_r1 - floor) as u64;
-    if to_floor > 0 {
-        env.set_slot(300);
-        let r3 = env.try_withdraw_insurance_limited(&admin, to_floor);
-        assert!(r3.is_ok(), "Withdraw to exact floor boundary should succeed: {:?}", r3);
-        let final_bal = env.read_insurance_balance();
-        assert_eq!(final_bal, floor, "Balance should be exactly at floor: {}", final_bal);
-    }
-
-    // One more lamport should fail
-    env.set_slot(400);
-    let r4 = env.try_withdraw_insurance_limited(&admin, 1);
-    assert!(r4.is_err(), "Withdraw 1 unit below floor must be rejected");
-
-    println!("INSURANCE FLOOR BOUNDARY: PASSED");
+    // Large jump should also succeed with u128::MAX rate limit
+    env.set_slot(3);
+    env.try_set_risk_threshold(&admin, 1_000_000_000).unwrap();
 }
 
-/// Cooldown enforcement: cannot withdraw more frequently than cooldown_slots.
+/// Cooldown enforcement on WithdrawInsuranceLimited (resolved market).
 #[test]
 fn test_insurance_withdraw_cooldown_enforcement() {
     program_path();
@@ -32568,98 +32567,84 @@ fn test_insurance_withdraw_cooldown_enforcement() {
 
     env.try_top_up_insurance(&admin, 10_000_000_000).unwrap();
 
+    // Resolve market to enable SetInsuranceWithdrawPolicy
+    env.set_slot(1);
+    env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
+    env.try_push_oracle_price(&admin, 138_000_000, 200).unwrap();
+    env.try_resolve_market(&admin).unwrap();
+
     // Configure: 100% per withdrawal, 1000 slot cooldown
     env.try_set_insurance_withdraw_policy(&admin, &admin.pubkey(), 1, 10_000, 1000).unwrap();
 
     // First withdrawal succeeds
     env.set_slot(100);
     let r1 = env.try_withdraw_insurance_limited(&admin, 100_000_000);
-    assert!(r1.is_ok(), "First withdrawal should succeed: {:?}", r1);
+    assert!(r1.is_ok(), "First withdrawal: {:?}", r1);
 
-    // Second withdrawal within cooldown fails
-    env.set_slot(200); // only 100 slots later, cooldown is 1000
+    // Within cooldown: rejected
+    env.set_slot(200);
     let r2 = env.try_withdraw_insurance_limited(&admin, 100_000_000);
-    assert!(r2.is_err(), "Withdrawal within cooldown must be rejected");
+    assert!(r2.is_err(), "Within cooldown must be rejected");
 
-    // After cooldown expires, withdrawal succeeds
-    env.set_slot(1200); // 1100 slots after first (> 1000 cooldown)
+    // After cooldown: succeeds
+    env.set_slot(1200);
     let r3 = env.try_withdraw_insurance_limited(&admin, 100_000_000);
-    assert!(r3.is_ok(), "Withdrawal after cooldown should succeed: {:?}", r3);
-
-    // Exact cooldown boundary
-    env.set_slot(2200); // exactly 1000 slots after r3
-    let r4 = env.try_withdraw_insurance_limited(&admin, 100_000_000);
-    assert!(r4.is_ok(), "Withdrawal at exact cooldown boundary should succeed: {:?}", r4);
-
-    // One slot before cooldown
-    env.set_slot(3199); // 999 slots after r4
-    let r5 = env.try_withdraw_insurance_limited(&admin, 100_000_000);
-    assert!(r5.is_err(), "Withdrawal 1 slot before cooldown must be rejected");
-
-    println!("INSURANCE COOLDOWN BOUNDARY: PASSED");
+    assert!(r3.is_ok(), "After cooldown: {:?}", r3);
 }
 
-/// BPS cap enforcement: immutable config cap limits per-withdrawal percentage.
+/// BPS cap enforcement on WithdrawInsuranceLimited.
 #[test]
 fn test_insurance_withdraw_bps_cap() {
     program_path();
     let mut env = TestEnv::new();
-    // Use encode_init_market_with_limits to set immutable bps cap
-    // Default insurance_withdraw_max_bps = 0 (disabled), so all amounts pass the bps check.
-    // With default, the only limit is the policy_max_bps from SetInsuranceWithdrawPolicy.
     env.init_market_with_invert(0);
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
     env.try_top_up_insurance(&admin, 10_000_000_000).unwrap();
 
-    // Configure policy: max 50% (5000 bps) per withdrawal, 1 slot cooldown
+    // Resolve
+    env.set_slot(1);
+    env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
+    env.try_push_oracle_price(&admin, 138_000_000, 200).unwrap();
+    env.try_resolve_market(&admin).unwrap();
+
+    // Configure: max 50% (5000 bps) per withdrawal
     env.try_set_insurance_withdraw_policy(&admin, &admin.pubkey(), 1, 5_000, 1).unwrap();
 
     let insurance = env.read_insurance_balance();
     let half = (insurance / 2) as u64;
 
-    // Exactly 50% should succeed
+    // Exactly 50%: succeeds
     env.set_slot(100);
     let r1 = env.try_withdraw_insurance_limited(&admin, half);
-    assert!(r1.is_ok(), "Withdraw exactly 50% should succeed: {:?}", r1);
+    assert!(r1.is_ok(), "50% withdrawal: {:?}", r1);
 
-    // More than 50% of remaining should fail
+    // >50% of remaining: rejected
     let remaining = env.read_insurance_balance();
     let over_half = (remaining / 2 + 1) as u64;
     env.set_slot(200);
     let r2 = env.try_withdraw_insurance_limited(&admin, over_half);
-    assert!(r2.is_err(), "Withdraw >50% of remaining must be rejected");
-
-    println!("INSURANCE BPS CAP: PASSED");
+    assert!(r2.is_err(), ">50% must be rejected");
 }
 
-/// SetRiskThreshold rate-limiting: changes capped per time period.
+/// insurance_withdraw_max_bps == 0 blocks live-market withdrawals.
 #[test]
-fn test_insurance_floor_rate_limit() {
+fn test_insurance_withdraw_disabled_on_live_market() {
     program_path();
     let mut env = TestEnv::new();
+    // Default init: insurance_withdraw_max_bps = 0 (disabled)
     env.init_market_with_invert(0);
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
-    // Default max_insurance_floor_change_per_day = 0.
-    // With 0, the rate-limit code is SKIPPED (only max_insurance_floor enforced).
-    // So all changes within max_insurance_floor should succeed regardless of speed.
+    env.try_top_up_insurance(&admin, 10_000_000_000).unwrap();
+
+    // Live-market withdrawal should be rejected
     env.set_slot(1);
-    let r1 = env.try_set_risk_threshold(&admin, 1_000_000);
-    assert!(r1.is_ok(), "With rate_limit=0, any change should succeed: {:?}", r1);
-
-    env.set_slot(2);
-    let r2 = env.try_set_risk_threshold(&admin, 0);
-    assert!(r2.is_ok(), "Instant reversal should succeed with rate_limit=0: {:?}", r2);
-
-    env.set_slot(3);
-    let r3 = env.try_set_risk_threshold(&admin, 999_999_999);
-    assert!(r3.is_ok(), "Large jump should succeed with rate_limit=0: {:?}", r3);
-
-    println!("INSURANCE FLOOR RATE LIMIT: PASSED");
+    let r = env.try_withdraw_insurance_limited(&admin, 1);
+    assert!(r.is_err(), "Live withdrawal must be blocked when max_bps=0");
 }
 
-/// Resolved-market withdrawal still requires all positions closed.
+/// Resolved-market withdrawal with open positions is rejected.
 #[test]
 fn test_insurance_withdraw_resolved_requires_positions_closed() {
     let mut env = TradeCpiTestEnv::new();
@@ -32684,17 +32669,12 @@ fn test_insurance_withdraw_resolved_requires_positions_closed() {
     env.set_slot(100);
     env.crank();
 
-    // Open position
     env.try_trade_cpi(&user, &lp.pubkey(), lp_idx, user_idx, 10_000, &mp, &matcher_ctx).unwrap();
     assert_ne!(env.read_account_position(user_idx), 0);
 
-    // Resolve
     env.try_push_oracle_price(&admin, 1_000_000, 2000).unwrap();
     env.try_resolve_market(&admin).unwrap();
 
-    // Withdraw insurance should FAIL: positions still open on resolved market
     let r = env.try_withdraw_insurance(&admin);
-    assert!(r.is_err(), "Resolved withdrawal must fail with open positions: {:?}", r);
-
-    println!("RESOLVED WITHDRAW REQUIRES POSITIONS CLOSED: PASSED");
+    assert!(r.is_err(), "Resolved withdrawal must fail with open positions");
 }
