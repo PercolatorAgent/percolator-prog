@@ -91,22 +91,7 @@ pub mod constants {
     pub const DEFAULT_THRESH_MIN_STEP: u128 = 1;
 }
 
-// 1b. Risk metric helpers (pure functions for anti-DoS threshold calculation)
-
-/// Compute net LP position for inventory-based funding.
-/// Scans LP accounts to compute sum of effective positions.
-#[inline]
-fn compute_net_lp_pos(engine: &percolator::RiskEngine) -> i128 {
-
-    let mut net: i128 = 0;
-    for i in 0..percolator::MAX_ACCOUNTS {
-        if engine.is_used(i) && engine.accounts[i].is_lp() {
-            let eff = engine.effective_pos_q(i);
-            net = net.saturating_add(eff);
-        }
-    }
-    net
-}
+// 1b. Insurance withdraw helpers
 
 // Packed insurance-withdraw metadata in config.authority_timestamp (i64/u64):
 // [max_withdraw_bps:16][last_withdraw_slot:48]
@@ -129,62 +114,6 @@ fn unpack_ins_withdraw_meta(packed: i64) -> (u16, u64) {
     let max_bps = ((raw >> 48) & 0xFFFF) as u16;
     let last_slot = raw & INS_WITHDRAW_LAST_SLOT_MASK;
     (max_bps, last_slot)
-}
-
-/// Compute inventory-based funding rate (bps per slot).
-///
-/// Engine convention:
-///   funding_rate_bps_per_slot > 0 => longs pay shorts
-///   (because pnl -= position * ΔF, ΔF>0 when rate>0)
-///
-/// Policy: rate sign follows LP inventory sign to push net_lp_pos toward 0.
-///   - If LP net long (net_lp_pos > 0), rate > 0 => longs pay => discourages longs => pushes inventory toward 0.
-///   - If LP net short (net_lp_pos < 0), rate < 0 => shorts pay => discourages shorts => pushes inventory toward 0.
-pub fn compute_inventory_funding_bps_per_slot(
-    net_lp_pos: i128,
-    price_e6: u64,
-    funding_horizon_slots: u64,
-    funding_k_bps: u64,
-    funding_inv_scale_notional_e6: u128,
-    funding_max_premium_bps: i64,
-    funding_max_bps_per_slot: i64,
-) -> i64 {
-    if net_lp_pos == 0 || price_e6 == 0 || funding_horizon_slots == 0 {
-        return 0;
-    }
-
-    let abs_pos: u128 = net_lp_pos.unsigned_abs();
-    let notional_e6: u128 = abs_pos.saturating_mul(price_e6 as u128) / 1_000_000u128;
-
-    // premium_bps = (notional / scale) * k_bps, capped
-    let mut premium_bps_u: u128 =
-        notional_e6.saturating_mul(funding_k_bps as u128) / funding_inv_scale_notional_e6.max(1);
-
-    if premium_bps_u > (funding_max_premium_bps.unsigned_abs() as u128) {
-        premium_bps_u = funding_max_premium_bps.unsigned_abs() as u128;
-    }
-
-    // Apply sign: if LP net long (net_lp_pos > 0), funding is positive
-    let signed_premium_bps: i64 = if net_lp_pos > 0 {
-        premium_bps_u as i64
-    } else {
-        -(premium_bps_u as i64)
-    };
-
-    // Convert to per-slot by dividing by horizon
-    let mut per_slot: i64 = signed_premium_bps / (funding_horizon_slots as i64);
-
-    // Sanity clamp: absolute max ±10000 bps/slot (100% per slot) to catch overflow bugs
-    per_slot = per_slot.clamp(-10_000, 10_000);
-
-    // Policy clamp: tighter bound per config
-    if per_slot > funding_max_bps_per_slot {
-        per_slot = funding_max_bps_per_slot;
-    }
-    if per_slot < -funding_max_bps_per_slot {
-        per_slot = -funding_max_bps_per_slot;
-    }
-    per_slot
 }
 
 // =============================================================================
@@ -3405,34 +3334,10 @@ pub mod processor {
                         return Err(PercolatorError::EngineUnauthorized.into());
                     }
                 }
-                // Execute crank with effective_caller_idx for clarity
-                // In permissionless mode, pass CRANK_NO_CALLER to engine (out-of-range = no caller settle)
-                let effective_caller_idx = if permissionless {
-                    CRANK_NO_CALLER
-                } else {
-                    caller_idx
-                };
-
-                // Compute funding rate:
-                // - Hyperp mode: use pre-computed rate (avoids borrow conflict)
-                // - Normal mode: inventory-based funding from LP net position
-                let effective_funding_rate = if let Some(rate) = hyperp_funding_rate {
-                    rate
-                } else {
-                    // Normal mode: inventory-based funding from LP net position
-                    // Engine internally gates same-slot compounding via dt = now_slot - last_funding_slot,
-                    // so passing the same rate multiple times in the same slot is harmless (dt=0 => no change).
-                    let net_lp_pos = crate::compute_net_lp_pos(engine);
-                    crate::compute_inventory_funding_bps_per_slot(
-                        net_lp_pos,
-                        price,
-                        config.funding_horizon_slots,
-                        config.funding_k_bps,
-                        config.funding_inv_scale_notional_e6,
-                        config.funding_max_premium_bps,
-                        config.funding_max_bps_per_slot,
-                    )
-                };
+                // Funding rate: engine uses zero-rate core profile
+                // (recompute_r_last_from_final_state always sets rate to 0).
+                // Funding accrual is handled internally by the engine via
+                // K-coefficient mechanism, not via external rate injection.
                 #[cfg(feature = "cu-audit")]
                 {
                     msg!("CU_CHECKPOINT: keeper_crank_start");

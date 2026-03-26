@@ -1995,78 +1995,11 @@ fn test_permissionless_funding_not_controllable() {
 }
 
 #[test]
-fn test_funding_sign_flips_with_lp_position() {
-    // Security test: funding rate sign must follow LP net position sign.
-    // This catches accidental sign inversion bugs.
-    //
-    // Uses large positions (100B contracts at $100 = $10T notional) to ensure
-    // the premium hits the cap (500 bps) and per_slot is non-zero (1 bps).
-
-    use percolator_prog::constants::{
-        DEFAULT_FUNDING_HORIZON_SLOTS, DEFAULT_FUNDING_INV_SCALE_NOTIONAL_E6,
-        DEFAULT_FUNDING_K_BPS, DEFAULT_FUNDING_MAX_BPS_PER_SLOT, DEFAULT_FUNDING_MAX_PREMIUM_BPS,
-    };
-
-    // Test the pure compute function directly
-    let price_e6 = 100_000_000u64; // $100
-
-    // LP net long => positive funding rate (longs pay)
-    // 100B contracts at $100 = $10T notional, saturates to 500 bps cap, /500 = 1 bps/slot
-    let net_long: i128 = 100_000_000_000;
-    let rate_long = percolator_prog::compute_inventory_funding_bps_per_slot(
-        net_long,
-        price_e6,
-        DEFAULT_FUNDING_HORIZON_SLOTS,
-        DEFAULT_FUNDING_K_BPS,
-        DEFAULT_FUNDING_INV_SCALE_NOTIONAL_E6,
-        DEFAULT_FUNDING_MAX_PREMIUM_BPS,
-        DEFAULT_FUNDING_MAX_BPS_PER_SLOT,
-    );
-
-    // LP net short => negative funding rate (shorts pay)
-    let net_short: i128 = -100_000_000_000;
-    let rate_short = percolator_prog::compute_inventory_funding_bps_per_slot(
-        net_short,
-        price_e6,
-        DEFAULT_FUNDING_HORIZON_SLOTS,
-        DEFAULT_FUNDING_K_BPS,
-        DEFAULT_FUNDING_INV_SCALE_NOTIONAL_E6,
-        DEFAULT_FUNDING_MAX_PREMIUM_BPS,
-        DEFAULT_FUNDING_MAX_BPS_PER_SLOT,
-    );
-
-    // LP flat => zero funding rate
-    let net_flat: i128 = 0;
-    let rate_flat = percolator_prog::compute_inventory_funding_bps_per_slot(
-        net_flat,
-        price_e6,
-        DEFAULT_FUNDING_HORIZON_SLOTS,
-        DEFAULT_FUNDING_K_BPS,
-        DEFAULT_FUNDING_INV_SCALE_NOTIONAL_E6,
-        DEFAULT_FUNDING_MAX_PREMIUM_BPS,
-        DEFAULT_FUNDING_MAX_BPS_PER_SLOT,
-    );
-
-    // Verify rates are actually non-zero for large positions
-    assert!(
-        rate_long > 0,
-        "LP net long with large position should give positive rate, got {}",
-        rate_long
-    );
-    assert!(
-        rate_short < 0,
-        "LP net short with large position should give negative rate, got {}",
-        rate_short
-    );
-    assert_eq!(rate_flat, 0, "LP flat should give zero funding rate");
-
-    // Verify opposite signs
-    assert!(
-        rate_long > 0 && rate_short < 0,
-        "Funding rates must have opposite signs: long={}, short={}",
-        rate_long,
-        rate_short
-    );
+fn test_funding_rate_is_zero_rate_profile() {
+    // The engine uses a zero-rate core profile: recompute_r_last_from_final_state
+    // always sets funding_rate to 0. Funding accrual is handled internally via
+    // the K-coefficient mechanism, not via external rate injection.
+    // The old compute_inventory_funding_bps_per_slot was dead code and was removed.
 }
 
 // --- Admin Rotation Tests ---

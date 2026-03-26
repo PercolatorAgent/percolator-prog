@@ -126,13 +126,14 @@ This section describes intent and operational ordering, not argument-by-argument
 - **InitMarket**
   - initializes slab header/config + constructs `RiskEngine::new(risk_params)`
   - binds vault token account + oracle keys into config
-  - initializes nonce + threshold update slot to zero
+  - initializes nonce to zero and threshold update slot to `clock.slot`
 - **UpdateAdmin**
   - rotates admin key
   - setting admin to all-zeros "burns" governance permanently (admin ops disabled forever)
 - **SetRiskThreshold**
   - sets `insurance_floor` (the minimum reserved insurance fund balance)
   - does **not** gate trades directly; side-mode gating is handled internally by the engine (see below)
+  - `max_insurance_floor_change_per_day` immutably rate-limits how much the floor can move per day; set to 0 to lock the floor after init
 
 ### Participant lifecycle
 - **InitUser**
@@ -145,13 +146,13 @@ This section describes intent and operational ordering, not argument-by-argument
   - performs oracle-read + engine checks; withdraws from vault via PDA signer; debits engine
 - **CloseAccount**
   - settles and withdraws remaining funds (subject to engine rules)
-  - on resolved markets, bypasses `touch_account_full` to avoid ADL overflow; uses `engine.free_slot()` directly
+  - uses `engine.close_account_resolved()` which handles position zeroing, PnL settlement with haircut, warmup bypass, vault decrement, and slot freeing internally
 
 ### Risk / maintenance
 - **KeeperCrank**
   - permissionless global maintenance entrypoint
   - two-phase design: keeper computes candidate shortlist off-chain using `preview_account_at_barrier`, then passes the candidate list in instruction data; on-chain processing operates only on shortlisted candidates
-  - accrues funding, charges maintenance fees, liquidates stale/unsafe accounts
+  - charges maintenance fees, liquidates stale/unsafe accounts; funding is handled internally via K-coefficient mechanism
   - optionally updates insurance floor via smoothed auto-threshold policy
 - **LiquidateAtOracle**
   - explicit liquidation for a specific target at current oracle
@@ -164,10 +165,28 @@ This section describes intent and operational ordering, not argument-by-argument
 - **TradeCpi**
   - trade via LP-chosen matcher CPI with strict binding + validation
 
+### Oracle management
+- **SetOracleAuthority** (Tag 13)
+  - sets the authority allowed to push oracle prices
+  - clears any stored authority price on authority change
+- **PushOraclePrice** (Tag 14)
+  - pushes an authority-signed oracle price; triggers circuit breaker if movement exceeds cap
+- **SetOraclePriceCap** (Tag 15)
+  - configures the per-slot price movement cap for the circuit breaker
+
+### Insurance management
+- **WithdrawInsuranceLimited** (Tag 22)
+  - rate-limited insurance withdrawal with immutable per-market caps (`insurance_withdraw_max_bps`, `insurance_withdraw_cooldown_slots`)
+  - on resolved markets: requires all positions closed
+  - on live markets: cannot withdraw below `insurance_floor`
+- **SetInsuranceWithdrawPolicy** (Tag 23)
+  - configures withdrawal policy (authority, max_bps, min_base, cooldown)
+  - resolved-only instruction (writes to oracle fields)
+
 ### Post-resolution admin
 - **AdminForceCloseAccount**
   - force-close abandoned accounts after market resolution
-  - bypasses `touch_account_full` on resolved markets; uses `engine.free_slot()` directly
+  - uses `engine.close_account_resolved()` which handles position zeroing, PnL settlement with haircut, warmup bypass, vault decrement, and slot freeing internally
   - verifies destination ATA owner matches stored account owner
 
 ---
@@ -213,6 +232,18 @@ Trade gating when the market is under-insured is handled **internally by the eng
 
 ### Insurance floor (`SetRiskThreshold`)
 `SetRiskThreshold` sets `insurance_floor`: the minimum insurance fund balance the market operator wishes to reserve. This is a bookkeeping/reservation mechanism — it does **not** directly gate trades. The auto-threshold policy in `KeeperCrank` updates `insurance_floor` periodically using a smoothed target derived from LP risk exposure, rate-limited to at most once per `THRESH_UPDATE_INTERVAL_SLOTS`.
+
+---
+
+## Hyperp mode
+
+Hyperp is an alternative pricing mode for markets that use an internal mark/index rather than an external oracle.
+
+- **Mark and index prices**: maintained entirely within the engine; no external oracle feed required for mark settlement.
+- **Premium-based funding**: funding accrues based on the spread between mark and index (premium), scaled by a K-coefficient. The K-coefficient mechanism replaces direct funding rate computation.
+- **Rate-limited index smoothing**: index price updates are clamped per slot via `clamp_toward_with_dt`, preventing instant mark-to-index jumps. When `dt = 0` or cap is zero, the function returns `index` unchanged (no movement).
+- **Mark price clamping on trade execution**: the execution mark is clamped against the index price to enforce the premium band on every trade.
+- **TradeNoCpi disabled**: `TradeNoCpi` is rejected in Hyperp mode; all trades must go through `TradeCpi`.
 
 ---
 
@@ -318,7 +349,7 @@ Kani harnesses are designed to prove program-level coupling invariants, includin
 Engine-specific invariants (conservation, warmup, liquidation properties, etc.) live in the `percolator` crate's verification suite. The program relies on engine correctness but does not restate it.
 
 ### Test suite
-- **Integration tests**: 454 (LiteSVM with production BPF binaries)
+- **Integration tests**: 462 (LiteSVM with production BPF binaries; 4 ignored)
 - **Unit tests**: 28
 - **Alignment tests**: 8
 - **Kani proofs**: 113
@@ -358,7 +389,7 @@ These are governance powers, not bugs:
    - withdraw insurance buffer to admin ATA.
    - impact: no insurance backstop remains.
 8. `AdminForceCloseAccount` (post-resolution only)
-   - force-close abandoned accounts.
+   - force-close abandoned accounts (no position-zero precondition required).
    - impact: users are forcibly settled/closed by admin action.
 9. `KeeperCrank` with `allow_panic != 0`
    - admin-only panic crank path.
@@ -389,9 +420,9 @@ These are intended hard boundaries enforced in code and test suites:
      `test_attack_set_oracle_price_cap_after_resolution_rejected`,
      `test_attack_set_maintenance_fee_after_resolution_rejected`,
      `test_attack_set_risk_threshold_after_resolution_rejected`.
-8. Cannot force-close arbitrary active positions.
-   - `AdminForceCloseAccount` requires resolved mode and zero position.
-   - covered by `test_admin_force_close_account_requires_resolved` and `test_admin_force_close_account_requires_zero_position`.
+8. Cannot force-close accounts on a live (non-resolved) market.
+   - `AdminForceCloseAccount` requires resolved mode.
+   - covered by `test_admin_force_close_account_requires_resolved`.
 9. Cannot redirect user close payouts to arbitrary token accounts in owner-gated paths.
    - user paths (`WithdrawCollateral`, `CloseAccount`) require owner signer and owner ATA checks.
    - `AdminForceCloseAccount` verifies destination ATA owner matches stored account owner.
