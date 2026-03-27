@@ -2869,6 +2869,10 @@ pub mod processor {
                 if invert > 1 {
                     return Err(ProgramError::InvalidInstructionData);
                 }
+                // conf_filter_bps: 0..=10_000 (0 = disabled, 10_000 = 100%)
+                if conf_filter_bps > 10_000 {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
                 // Validate unit_scale: reject huge values that make most deposits credit 0 units
                 if !crate::verify::init_market_scale_ok(unit_scale) {
                     return Err(ProgramError::InvalidInstructionData);
@@ -2911,8 +2915,13 @@ pub mod processor {
                 // Normalize initial mark price to engine-space (invert + scale).
                 // All Hyperp internal prices must be in engine-space.
                 let initial_mark_price_e6 = if is_hyperp {
-                    crate::verify::to_engine_price(initial_mark_price_e6, invert, unit_scale)
-                        .ok_or(PercolatorError::OracleInvalid)?
+                    let p = crate::verify::to_engine_price(initial_mark_price_e6, invert, unit_scale)
+                        .ok_or(PercolatorError::OracleInvalid)?;
+                    // Enforce MAX_ORACLE_PRICE at genesis — same invariant as runtime ingress
+                    if p > percolator::MAX_ORACLE_PRICE {
+                        return Err(PercolatorError::OracleInvalid.into());
+                    }
+                    p
                 } else {
                     initial_mark_price_e6
                 };
@@ -3857,10 +3866,11 @@ pub mod processor {
                     state::write_req_nonce(&mut data, req_id);
 
                     // Hyperp: update mark with exec price (already engine-space).
-                    // exec_price validated <= MAX_ORACLE_PRICE before engine call.
+                    // Clamp against INDEX (not previous mark) — bounds mark-index
+                    // gap to one cap-width per fill, consistent with PushOraclePrice.
                     if is_hyperp {
                         let clamped_mark = oracle::clamp_oracle_price(
-                            config.authority_price_e6,
+                            config.last_effective_price_e6,
                             ret.exec_price_e6,
                             config.oracle_price_cap_e2bps,
                         );
@@ -4375,14 +4385,12 @@ pub mod processor {
                 }
 
                 // Clamp against circuit breaker.
-                // Hyperp: clamp against previous MARK (authority_price_e6)
-                //   to prevent large jumps from mark, not from index.
+                // Hyperp: clamp against INDEX (last_effective_price_e6), not
+                //   previous mark. This bounds the mark-index gap to one
+                //   cap-width regardless of how many same-slot pushes occur.
+                //   The index only moves per-slot via clamp_toward_with_dt.
                 // Non-Hyperp: clamp against last_effective_price_e6 baseline.
-                let clamp_base = if is_hyperp {
-                    config.authority_price_e6
-                } else {
-                    config.last_effective_price_e6
-                };
+                let clamp_base = config.last_effective_price_e6;
                 let clamped = oracle::clamp_oracle_price(
                     clamp_base,
                     normalized_price,
