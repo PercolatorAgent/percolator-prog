@@ -411,6 +411,7 @@ impl TestEnv {
                 AccountMeta::new(ata, false),
                 AccountMeta::new(self.vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(sysvar::clock::ID, false),
                 AccountMeta::new_readonly(matcher, false),
                 AccountMeta::new_readonly(ctx, false),
             ],
@@ -626,6 +627,126 @@ impl TestEnv {
             .send_transaction(tx)
             .expect("top_up_insurance failed");
     }
+}
+
+// --- Encode helpers for all instruction types ---
+
+fn encode_withdraw(user_idx: u16, amount: u64) -> Vec<u8> {
+    let mut data = vec![4u8];
+    data.extend_from_slice(&user_idx.to_le_bytes());
+    data.extend_from_slice(&amount.to_le_bytes());
+    data
+}
+
+fn encode_liquidate(target_idx: u16) -> Vec<u8> {
+    let mut data = vec![7u8];
+    data.extend_from_slice(&target_idx.to_le_bytes());
+    data
+}
+
+fn encode_close_account(user_idx: u16) -> Vec<u8> {
+    let mut data = vec![8u8];
+    data.extend_from_slice(&user_idx.to_le_bytes());
+    data
+}
+
+fn encode_top_up_insurance(amount: u64) -> Vec<u8> {
+    let mut data = vec![9u8];
+    data.extend_from_slice(&amount.to_le_bytes());
+    data
+}
+
+fn encode_set_risk_threshold(new_threshold: u128) -> Vec<u8> {
+    let mut data = vec![11u8];
+    data.extend_from_slice(&new_threshold.to_le_bytes());
+    data
+}
+
+fn encode_update_admin(new_admin: &Pubkey) -> Vec<u8> {
+    let mut data = vec![12u8];
+    data.extend_from_slice(new_admin.as_ref());
+    data
+}
+
+fn encode_close_slab() -> Vec<u8> {
+    vec![13u8]
+}
+
+fn encode_update_config(
+    funding_horizon_slots: u64,
+    funding_k_bps: u64,
+    funding_inv_scale_notional_e6: u128,
+    funding_max_premium_bps: i64,
+    funding_max_bps_per_slot: i64,
+    thresh_floor: u128,
+    thresh_risk_bps: u64,
+    thresh_update_interval_slots: u64,
+    thresh_step_bps: u64,
+    thresh_alpha_bps: u64,
+    thresh_min: u128,
+    thresh_max: u128,
+    thresh_min_step: u128,
+) -> Vec<u8> {
+    let mut data = vec![14u8];
+    data.extend_from_slice(&funding_horizon_slots.to_le_bytes());
+    data.extend_from_slice(&funding_k_bps.to_le_bytes());
+    data.extend_from_slice(&funding_inv_scale_notional_e6.to_le_bytes());
+    data.extend_from_slice(&funding_max_premium_bps.to_le_bytes());
+    data.extend_from_slice(&funding_max_bps_per_slot.to_le_bytes());
+    data.extend_from_slice(&thresh_floor.to_le_bytes());
+    data.extend_from_slice(&thresh_risk_bps.to_le_bytes());
+    data.extend_from_slice(&thresh_update_interval_slots.to_le_bytes());
+    data.extend_from_slice(&thresh_step_bps.to_le_bytes());
+    data.extend_from_slice(&thresh_alpha_bps.to_le_bytes());
+    data.extend_from_slice(&thresh_min.to_le_bytes());
+    data.extend_from_slice(&thresh_max.to_le_bytes());
+    data.extend_from_slice(&thresh_min_step.to_le_bytes());
+    data
+}
+
+fn encode_set_maintenance_fee(new_fee: u128) -> Vec<u8> {
+    let mut data = vec![15u8];
+    data.extend_from_slice(&new_fee.to_le_bytes());
+    data
+}
+
+fn encode_set_oracle_authority(new_authority: &Pubkey) -> Vec<u8> {
+    let mut data = vec![16u8];
+    data.extend_from_slice(new_authority.as_ref());
+    data
+}
+
+fn encode_push_oracle_price(price_e6: u64, timestamp: i64) -> Vec<u8> {
+    let mut data = vec![17u8];
+    data.extend_from_slice(&price_e6.to_le_bytes());
+    data.extend_from_slice(&timestamp.to_le_bytes());
+    data
+}
+
+fn encode_set_oracle_price_cap(max_change_e2bps: u64) -> Vec<u8> {
+    let mut data = vec![18u8];
+    data.extend_from_slice(&max_change_e2bps.to_le_bytes());
+    data
+}
+
+fn encode_resolve_market() -> Vec<u8> {
+    vec![19u8]
+}
+
+fn encode_withdraw_insurance() -> Vec<u8> {
+    vec![20u8]
+}
+
+fn encode_admin_force_close_account(user_idx: u16) -> Vec<u8> {
+    let mut data = vec![21u8];
+    data.extend_from_slice(&user_idx.to_le_bytes());
+    data
+}
+
+fn encode_query_lp_fees(lp_idx: u16) -> Vec<u8> {
+    let mut data = vec![24u8];
+    data.extend_from_slice(&lp_idx.to_le_bytes());
+    data
 }
 
 fn create_users(env: &mut TestEnv, count: usize, deposit_amount: u64) -> Vec<Keypair> {
@@ -1566,4 +1687,399 @@ fn benchmark_worst_case_scenarios() {
     );
     println!("• Key metric: worst single crank must stay under 1.4M CU");
     println!("• ADL/liquidation processing adds CU overhead per affected account");
+}
+
+/// Per-instruction CU benchmark covering all instruction types.
+/// Measures CU consumed for each instruction under typical conditions.
+#[cfg(not(feature = "test"))]
+#[test]
+fn benchmark_all_instructions() {
+    println!("\n=== PER-INSTRUCTION CU BENCHMARK ===\n");
+
+    let mut env = TestEnv::new();
+    env.init_market();
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 50_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 10_000_000_000);
+
+    env.set_price(100_000_000, 200);
+    env.crank();
+
+    // Helper: send instruction, return CU consumed
+    let measure = |svm: &mut LiteSVM, ix: Instruction, signers: &[&Keypair]| -> Result<u64, String> {
+        let budget = ComputeBudgetInstruction::set_compute_unit_limit(1_400_000);
+        let payer = signers[0];
+        let tx = Transaction::new_signed_with_payer(
+            &[budget, ix],
+            Some(&payer.pubkey()),
+            signers,
+            svm.latest_blockhash(),
+        );
+        match svm.send_transaction(tx) {
+            Ok(r) => Ok(r.compute_units_consumed),
+            Err(e) => Err(format!("{:?}", e)),
+        }
+    };
+
+    let (vault_pda, _) =
+        Pubkey::find_program_address(&[b"vault", env.slab.as_ref()], &env.program_id);
+
+    // --- TradeNoCpi (Tag 6) ---
+    {
+        let ix = Instruction {
+            program_id: env.program_id,
+            accounts: vec![
+                AccountMeta::new(user.pubkey(), true),
+                AccountMeta::new(lp.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+                AccountMeta::new_readonly(sysvar::clock::ID, false),
+                AccountMeta::new_readonly(env.pyth_index, false),
+            ],
+            data: encode_trade(lp_idx, user_idx, 100_000),
+        };
+        let cu = measure(&mut env.svm, ix, &[&user, &lp]).unwrap();
+        println!("TradeNoCpi:            {:>8} CU", cu);
+    }
+
+    // --- DepositCollateral (Tag 3) ---
+    {
+        let ata = env.create_ata(&user.pubkey(), 1_000_000);
+        let ix = Instruction {
+            program_id: env.program_id,
+            accounts: vec![
+                AccountMeta::new(user.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+                AccountMeta::new(ata, false),
+                AccountMeta::new(env.vault, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(sysvar::clock::ID, false),
+            ],
+            data: encode_deposit(user_idx, 1_000_000),
+        };
+        let cu = measure(&mut env.svm, ix, &[&user]).unwrap();
+        println!("DepositCollateral:     {:>8} CU", cu);
+    }
+
+    // --- WithdrawCollateral (Tag 4) ---
+    {
+        env.set_price(100_000_000, 300);
+        env.crank();
+        let ata = env.create_ata(&user.pubkey(), 0);
+        let ix = Instruction {
+            program_id: env.program_id,
+            accounts: vec![
+                AccountMeta::new(user.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+                AccountMeta::new(env.vault, false),
+                AccountMeta::new(ata, false),
+                AccountMeta::new_readonly(vault_pda, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(sysvar::clock::ID, false),
+                AccountMeta::new_readonly(env.pyth_index, false),
+            ],
+            data: encode_withdraw(user_idx, 100_000),
+        };
+        let cu = measure(&mut env.svm, ix, &[&user]).unwrap();
+        println!("WithdrawCollateral:    {:>8} CU", cu);
+    }
+
+    // --- KeeperCrank (Tag 5) ---
+    {
+        env.set_price(100_000_000, 400);
+        let cu = env.crank();
+        println!("KeeperCrank:           {:>8} CU", cu);
+    }
+
+    // --- TopUpInsurance (Tag 9) ---
+    {
+        let ata = env.create_ata(&admin.pubkey(), 1_000_000);
+        let ix = Instruction {
+            program_id: env.program_id,
+            accounts: vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+                AccountMeta::new(ata, false),
+                AccountMeta::new(env.vault, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(sysvar::clock::ID, false),
+            ],
+            data: encode_top_up_insurance(1_000_000),
+        };
+        let cu = measure(&mut env.svm, ix, &[&admin]).unwrap();
+        println!("TopUpInsurance:        {:>8} CU", cu);
+    }
+
+    // --- SetRiskThreshold (Tag 11) ---
+    {
+        env.set_price(100_000_000, 500);
+        let ix = Instruction {
+            program_id: env.program_id,
+            accounts: vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+                AccountMeta::new_readonly(sysvar::clock::ID, false),
+            ],
+            data: encode_set_risk_threshold(1_000_000),
+        };
+        let cu = measure(&mut env.svm, ix, &[&admin]).unwrap();
+        println!("SetRiskThreshold:      {:>8} CU", cu);
+    }
+
+    // --- UpdateConfig (Tag 14) ---
+    {
+        let ix = Instruction {
+            program_id: env.program_id,
+            accounts: vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+            ],
+            data: encode_update_config(
+                3600,   // funding_horizon_slots
+                100,    // funding_k_bps
+                1_000_000, // funding_inv_scale_notional_e6
+                500,    // funding_max_premium_bps
+                5,      // funding_max_bps_per_slot
+                0,      // thresh_floor
+                100,    // thresh_risk_bps
+                100,    // thresh_update_interval_slots
+                100,    // thresh_step_bps
+                5000,   // thresh_alpha_bps
+                0,      // thresh_min
+                1_000_000_000_000_000, // thresh_max (must be <= max_insurance_floor)
+                1,      // thresh_min_step
+            ),
+        };
+        let cu = measure(&mut env.svm, ix, &[&admin]).unwrap();
+        println!("UpdateConfig:          {:>8} CU", cu);
+    }
+
+    // --- SetMaintenanceFee (Tag 15) ---
+    {
+        let ix = Instruction {
+            program_id: env.program_id,
+            accounts: vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+            ],
+            data: encode_set_maintenance_fee(0),
+        };
+        let cu = measure(&mut env.svm, ix, &[&admin]).unwrap();
+        println!("SetMaintenanceFee:     {:>8} CU", cu);
+    }
+
+    // --- SetOracleAuthority (Tag 16) ---
+    {
+        let ix = Instruction {
+            program_id: env.program_id,
+            accounts: vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+            ],
+            data: encode_set_oracle_authority(&admin.pubkey()),
+        };
+        let cu = measure(&mut env.svm, ix, &[&admin]).unwrap();
+        println!("SetOracleAuthority:    {:>8} CU", cu);
+    }
+
+    // --- PushOraclePrice (Tag 17) ---
+    {
+        let ix = Instruction {
+            program_id: env.program_id,
+            accounts: vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+            ],
+            data: encode_push_oracle_price(100_000_000, 600),
+        };
+        let cu = measure(&mut env.svm, ix, &[&admin]).unwrap();
+        println!("PushOraclePrice:       {:>8} CU", cu);
+    }
+
+    // --- SetOraclePriceCap (Tag 18) ---
+    {
+        let ix = Instruction {
+            program_id: env.program_id,
+            accounts: vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+            ],
+            data: encode_set_oracle_price_cap(10_000),
+        };
+        let cu = measure(&mut env.svm, ix, &[&admin]).unwrap();
+        println!("SetOraclePriceCap:     {:>8} CU", cu);
+    }
+
+    // --- QueryLpFees (Tag 24) ---
+    {
+        let ix = Instruction {
+            program_id: env.program_id,
+            accounts: vec![
+                AccountMeta::new_readonly(env.slab, false),
+            ],
+            data: encode_query_lp_fees(lp_idx),
+        };
+        let cu = measure(&mut env.svm, ix, &[&admin]).unwrap();
+        println!("QueryLpFees:           {:>8} CU", cu);
+    }
+
+    // --- LiquidateAtOracle (Tag 7) ---
+    // Make user underwater first
+    {
+        // Big price drop to make user liquidatable
+        env.set_price(50_000_000, 700); // $100 -> $50
+        env.crank();
+        let caller = Keypair::new();
+        env.svm.airdrop(&caller.pubkey(), 1_000_000_000).unwrap();
+        let ix = Instruction {
+            program_id: env.program_id,
+            accounts: vec![
+                AccountMeta::new(caller.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+                AccountMeta::new_readonly(sysvar::clock::ID, false),
+                AccountMeta::new_readonly(env.pyth_index, false),
+            ],
+            data: encode_liquidate(user_idx),
+        };
+        match measure(&mut env.svm, ix, &[&caller]) {
+            Ok(cu) => println!("LiquidateAtOracle:     {:>8} CU", cu),
+            Err(_) => println!("LiquidateAtOracle:     (user not liquidatable at this price)"),
+        }
+    }
+
+    // --- CloseAccount (Tag 8) ---
+    // Close position first, then close account
+    {
+        // Restore price and flatten position via opposing trade
+        env.set_price(100_000_000, 800);
+        env.crank();
+        // Trade to flatten (negative = close long)
+        env.trade(&user, &lp, lp_idx, user_idx, -100_000);
+        env.set_price(100_000_000, 810);
+        env.crank();
+
+        let user_ata = env.create_ata(&user.pubkey(), 0);
+        let ix = Instruction {
+            program_id: env.program_id,
+            accounts: vec![
+                AccountMeta::new(user.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+                AccountMeta::new(env.vault, false),
+                AccountMeta::new(user_ata, false),
+                AccountMeta::new_readonly(vault_pda, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(sysvar::clock::ID, false),
+                AccountMeta::new_readonly(env.pyth_index, false),
+            ],
+            data: encode_close_account(user_idx),
+        };
+        match measure(&mut env.svm, ix, &[&user]) {
+            Ok(cu) => println!("CloseAccount:          {:>8} CU", cu),
+            Err(e) => println!("CloseAccount:          (failed: {})", &e[..80.min(e.len())]),
+        }
+    }
+
+    // --- UpdateAdmin (Tag 12) ---
+    {
+        let ix = Instruction {
+            program_id: env.program_id,
+            accounts: vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+            ],
+            data: encode_update_admin(&admin.pubkey()),
+        };
+        let cu = measure(&mut env.svm, ix, &[&admin]).unwrap();
+        println!("UpdateAdmin:           {:>8} CU", cu);
+    }
+
+    // --- ResolveMarket + resolved-path instructions ---
+    {
+        // Top up insurance so WithdrawInsurance has something to withdraw
+        env.top_up_insurance(&Keypair::from_bytes(&admin.to_bytes()).unwrap(), 1_000_000);
+
+        env.set_price(100_000_000, 900);
+        env.crank();
+
+        // Resolve
+        let ix = Instruction {
+            program_id: env.program_id,
+            accounts: vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+            ],
+            data: encode_resolve_market(),
+        };
+        let cu = measure(&mut env.svm, ix, &[&admin]).unwrap();
+        println!("ResolveMarket:         {:>8} CU", cu);
+
+        // Resolved KeeperCrank
+        env.set_price(100_000_000, 1000);
+        let cu = env.crank();
+        println!("KeeperCrank(resolved): {:>8} CU", cu);
+
+        // AdminForceCloseAccount (Tag 21) - close LP
+        let lp_ata = env.create_ata(&lp.pubkey(), 0);
+        let ix = Instruction {
+            program_id: env.program_id,
+            accounts: vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+                AccountMeta::new(env.vault, false),
+                AccountMeta::new(lp_ata, false),
+                AccountMeta::new_readonly(vault_pda, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(sysvar::clock::ID, false),
+                AccountMeta::new_readonly(env.pyth_index, false),
+            ],
+            data: encode_admin_force_close_account(lp_idx),
+        };
+        let cu = measure(&mut env.svm, ix, &[&admin]).unwrap();
+        println!("AdminForceClose:       {:>8} CU", cu);
+
+        // WithdrawInsurance (Tag 20) - all accounts now closed
+        let admin_ata = env.create_ata(&admin.pubkey(), 0);
+        let ix = Instruction {
+            program_id: env.program_id,
+            accounts: vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+                AccountMeta::new(admin_ata, false),
+                AccountMeta::new(env.vault, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(vault_pda, false),
+            ],
+            data: encode_withdraw_insurance(),
+        };
+        match measure(&mut env.svm, ix, &[&admin]) {
+            Ok(cu) => println!("WithdrawInsurance:     {:>8} CU", cu),
+            Err(e) => println!("WithdrawInsurance:     (failed: {})", &e[..80.min(e.len())]),
+        }
+
+        // CloseSlab (Tag 13)
+        let admin_ata2 = env.create_ata(&admin.pubkey(), 0);
+        let ix = Instruction {
+            program_id: env.program_id,
+            accounts: vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+                AccountMeta::new(env.vault, false),
+                AccountMeta::new_readonly(vault_pda, false),
+                AccountMeta::new(admin_ata2, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            data: encode_close_slab(),
+        };
+        match measure(&mut env.svm, ix, &[&admin]) {
+            Ok(cu) => println!("CloseSlab:             {:>8} CU", cu),
+            Err(e) => println!("CloseSlab:             (failed: {})", &e[..80.min(e.len())]),
+        }
+    }
+
+    println!("\n=== END PER-INSTRUCTION CU BENCHMARK ===");
 }
