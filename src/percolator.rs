@@ -2917,6 +2917,18 @@ pub mod processor {
                 if !crate::verify::init_market_scale_ok(unit_scale) {
                     return Err(ProgramError::InvalidInstructionData);
                 }
+                // Margin params: initial >= maintenance, both non-zero, initial <= 100%
+                if risk_params.initial_margin_bps == 0
+                    || risk_params.maintenance_margin_bps == 0
+                {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+                if risk_params.initial_margin_bps > 10_000 {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+                if risk_params.initial_margin_bps < risk_params.maintenance_margin_bps {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
                 // insurance_withdraw_max_bps is a percentage (0..=10_000)
                 if insurance_withdraw_max_bps > 10_000 {
                     return Err(ProgramError::InvalidInstructionData);
@@ -3328,12 +3340,13 @@ pub mod processor {
                     return Err(PercolatorError::EngineUnauthorized.into());
                 }
 
-                // On resolved markets, settle lazy effects at settlement price
-                // before withdrawal (same pattern as CloseAccount resolved path).
+                // On resolved markets, best-effort settlement at settlement price.
+                // If touch fails (ADL overflow), withdraw proceeds with
+                // locally-settled state — same as AdminForceCloseAccount.
                 if resolved {
-                    engine.touch_account_full(
+                    let _ = engine.touch_account_full(
                         user_idx as usize, price, clock.slot,
-                    ).map_err(map_risk_error)?;
+                    );
                 }
 
                 // Reject misaligned withdrawal amounts (cleaner UX than silent floor)
@@ -3870,7 +3883,7 @@ pub mod processor {
                 let exec_price = ret.exec_price_e6;
                 // Reject extreme exec prices that would corrupt engine state
                 // or produce absurd PnL. Must check BEFORE engine call.
-                if is_hyperp && exec_price > percolator::MAX_ORACLE_PRICE {
+                if exec_price > percolator::MAX_ORACLE_PRICE {
                     return Err(PercolatorError::OracleInvalid.into());
                 }
                 {
@@ -4320,6 +4333,9 @@ pub mod processor {
                     return Err(PercolatorError::InvalidConfigParam.into());
                 }
                 if thresh_alpha_bps > 10_000 {
+                    return Err(PercolatorError::InvalidConfigParam.into());
+                }
+                if thresh_update_interval_slots == 0 {
                     return Err(PercolatorError::InvalidConfigParam.into());
                 }
                 if thresh_min > thresh_max {
