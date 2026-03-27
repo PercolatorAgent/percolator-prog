@@ -275,7 +275,8 @@ pub mod verify {
         owner_ok(stored_owner, signer)
     }
 
-    /// Trade authorization: both user and LP owners must match signers.
+    /// Trade authorization for TradeNoCpi: both user and LP must be signers.
+    /// For TradeCpi, LP authorization uses key-equality + CPI binding instead.
     #[inline]
     pub fn trade_authorized(
         user_owner: [u8; 32],
@@ -309,7 +310,11 @@ pub mod verify {
     /// * `pda_ok` - Whether LP PDA matches expected derivation
     /// * `abi_ok` - Whether matcher return passes ABI validation
     /// * `user_auth_ok` - Whether user signer matches user owner
-    /// * `lp_auth_ok` - Whether LP signer matches LP owner
+    /// * `lp_key_ok` - Whether provided LP owner key matches stored LP owner.
+    ///   NOTE: Runtime TradeCpi does NOT require LP owner to be a signer.
+    ///   LP authorization is delegated to the matcher program at registration
+    ///   time — the CPI identity binding (matcher_identity_ok) is the actual
+    ///   LP-side authorization gate. This parameter models key-equality only.
     /// * `gate_active` - Whether the risk-reduction gate is active
     /// * `risk_increase` - Whether this trade would increase system risk
     /// * `exec_size` - The exec_size from matcher return
@@ -321,7 +326,7 @@ pub mod verify {
         pda_ok: bool,
         abi_ok: bool,
         user_auth_ok: bool,
-        lp_auth_ok: bool,
+        lp_key_ok: bool,
         gate_active: bool,
         risk_increase: bool,
         exec_size: i128,
@@ -335,8 +340,8 @@ pub mod verify {
         if !pda_ok {
             return TradeCpiDecision::Reject;
         }
-        // 3. Owner authorization (user and LP)
-        if !user_auth_ok || !lp_auth_ok {
+        // 3. Owner authorization (user signer + LP key equality)
+        if !user_auth_ok || !lp_key_ok {
             return TradeCpiDecision::Reject;
         }
         // 4. Matcher identity binding
@@ -433,8 +438,9 @@ pub mod verify {
     /// * `identity_ok` - Whether matcher identity matches LP registration
     /// * `pda_ok` - Whether LP PDA matches expected derivation
     /// * `user_auth_ok` - Whether user signer matches user owner
-    /// * `lp_auth_ok` - Whether LP signer matches LP owner
-    /// * `gate_active` - Whether the risk-reduction gate is active
+    /// * `lp_key_ok` - Whether provided LP owner key matches stored LP owner
+    ///   (key-equality only, not signer — see decide_trade_cpi docs)
+    /// * `gate_is_active` - Whether the risk-reduction gate is active
     /// * `risk_increase` - Whether this trade would increase system risk
     /// * `ret` - The matcher return fields (from CPI)
     /// * `lp_account_id` - Expected LP account ID from request
@@ -447,7 +453,7 @@ pub mod verify {
         identity_ok: bool,
         pda_ok: bool,
         user_auth_ok: bool,
-        lp_auth_ok: bool,
+        lp_key_ok: bool,
         gate_is_active: bool,
         risk_increase: bool,
         ret: MatcherReturnFields,
@@ -464,8 +470,8 @@ pub mod verify {
         if !pda_ok {
             return TradeCpiDecision::Reject;
         }
-        // 3. Owner authorization (user and LP)
-        if !user_auth_ok || !lp_auth_ok {
+        // 3. Owner authorization (user signer + LP key equality)
+        if !user_auth_ok || !lp_key_ok {
             return TradeCpiDecision::Reject;
         }
         // 4. Matcher identity binding
@@ -500,6 +506,8 @@ pub mod verify {
     }
 
     /// Pure decision function for TradeNoCpi instruction.
+    /// * `lp_auth_ok` - Whether LP signer matches stored LP owner.
+    ///   NOTE: TradeNoCpi requires LP to be a signer (unlike TradeCpi).
     #[inline]
     pub fn decide_trade_nocpi(
         user_auth_ok: bool,
@@ -2986,6 +2994,10 @@ pub mod processor {
                     last_insurance_withdraw_slot: 0,
                     _liw_padding: 0,
                 };
+                // Hyperp markets must have non-zero cap for index smoothing
+                if is_hyperp && config.oracle_price_cap_e2bps == 0 {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
                 state::write_config(&mut data, &config);
 
                 let new_header = SlabHeader {
@@ -3356,7 +3368,9 @@ pub mod processor {
                             //   first successful application.
                             //
                             // Accounts where touch never succeeds (ADL overflow)
-                            // are handled by close_account_resolved, which operates
+                            // are force-closed via AdminForceCloseAccount, which
+                            // does best-effort touch then falls through to
+                            // close_account_resolved using stored local state.
                             // on stored local state without accrue/settle.
                             let _ = engine.touch_account_full(
                                 idx as usize, settlement_price, clock.slot,
@@ -4484,11 +4498,15 @@ pub mod processor {
                 let header = state::read_header(&data);
                 require_admin(header.admin, a_admin.key)?;
 
-                // Enforce per-market admin limit: non-zero cap must be >= floor.
-                // 0 disables the circuit breaker entirely (clamp_oracle_price
-                // returns raw_price when cap==0). The saturating conversion in
-                // clamp_oracle_price handles oversized caps safely.
                 let config = state::read_config(&data);
+                let is_hyperp = oracle::is_hyperp_mode(&config);
+
+                // Hyperp markets must not set cap to 0 — it would freeze index
+                // smoothing (clamp_toward_with_dt returns mark unchanged when cap==0).
+                if is_hyperp && max_change_e2bps == 0 {
+                    return Err(PercolatorError::InvalidConfigParam.into());
+                }
+                // Non-zero cap must be >= per-market floor.
                 if max_change_e2bps != 0
                     && max_change_e2bps < config.min_oracle_price_cap_e2bps
                 {
@@ -4945,11 +4963,15 @@ pub mod processor {
                 let owner_pubkey = Pubkey::new_from_array(engine.accounts[user_idx as usize].owner);
                 verify_token_account(a_owner_ata, &owner_pubkey, &mint)?;
 
-                // Settle lazy effects at settlement price before closing.
-                // See convergence argument in CloseAccount resolved path.
-                engine.touch_account_full(
+                // Best-effort settlement. If touch permanently fails (e.g., ADL
+                // overflow from extreme K-pair imbalance), admin can still force-close
+                // using close_account_resolved's local-state-only path. The user
+                // receives whatever capital remains after local settlement — this may
+                // haircut positive PnL but prevents permanent account wedging that
+                // would block WithdrawInsurance and CloseSlab.
+                let _ = engine.touch_account_full(
                     user_idx as usize, price, clock.slot,
-                ).map_err(map_risk_error)?;
+                );
                 let amt_units = engine.close_account_resolved(user_idx)
                     .map_err(map_risk_error)?;
                 let amt_units_u64: u64 = amt_units

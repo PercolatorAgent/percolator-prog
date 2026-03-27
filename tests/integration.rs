@@ -32273,10 +32273,18 @@ fn test_insurance_withdraw_disabled_on_live_market() {
 
     env.try_top_up_insurance(&admin, 10_000_000_000).unwrap();
 
+    // Capture state before rejected operation
+    let vault_before = env.vault_balance();
+    let insurance_before = env.read_insurance_balance();
+
     // Live-market withdrawal should be rejected
     env.set_slot(1);
     let r = env.try_withdraw_insurance_limited(&admin, 1);
     assert!(r.is_err(), "Live withdrawal must be blocked when max_bps=0");
+
+    // State must be unchanged after rejection
+    assert_eq!(env.vault_balance(), vault_before, "vault_balance must be preserved after rejection");
+    assert_eq!(env.read_insurance_balance(), insurance_before, "insurance_balance must be preserved after rejection");
 }
 
 /// Resolved-market withdrawal with open positions is rejected.
@@ -32669,6 +32677,8 @@ fn test_init_market_rejects_vault_with_delegate() {
     );
     let result = svm.send_transaction(tx);
     assert!(result.is_err(), "InitMarket must reject vault with delegate");
+    // Slab remains uninitialized — InitMarket failed before writing header/config,
+    // so no state preservation check is needed (there is no prior valid state).
 }
 
 /// Vault with close_authority must be rejected by InitMarket.
@@ -32735,6 +32745,8 @@ fn test_init_market_rejects_vault_with_close_authority() {
     );
     let result = svm.send_transaction(tx);
     assert!(result.is_err(), "InitMarket must reject vault with close_authority");
+    // Slab remains uninitialized — InitMarket failed before writing header/config,
+    // so no state preservation check is needed (there is no prior valid state).
 }
 
 /// LiquidateAtOracle must be blocked on resolved markets.
@@ -32757,9 +32769,17 @@ fn test_liquidate_blocked_on_resolved_market() {
 
     env.try_resolve_market(&admin).unwrap();
 
+    // Capture state before rejected operation
+    let position_before = env.read_account_position(user_idx);
+    let capital_before = env.read_account_capital(user_idx);
+
     // Liquidation must fail on resolved market
     let result = env.try_liquidate(user_idx);
     assert!(result.is_err(), "LiquidateAtOracle must be blocked on resolved markets");
+
+    // Position and capital must be unchanged after rejection
+    assert_eq!(env.read_account_position(user_idx), position_before, "position must be preserved after rejected liquidation");
+    assert_eq!(env.read_account_capital(user_idx), capital_before, "capital must be preserved after rejected liquidation");
 }
 
 /// UpdateConfig must reject negative funding_max_premium_bps.
@@ -32769,6 +32789,9 @@ fn test_update_config_rejects_negative_funding_max_premium() {
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    // Capture config snapshot before rejected operation
+    let config_before = env.read_update_config_snapshot();
 
     let ix = Instruction {
         program_id: env.program_id,
@@ -32788,6 +32811,9 @@ fn test_update_config_rejects_negative_funding_max_premium() {
     );
     let result = env.svm.send_transaction(tx);
     assert!(result.is_err(), "Negative funding_max_premium_bps must be rejected");
+
+    // Config must be unchanged after rejection
+    assert_eq!(env.read_update_config_snapshot(), config_before, "config must be preserved after rejected UpdateConfig");
 }
 
 /// UpdateConfig must reject negative funding_max_bps_per_slot.
@@ -32797,6 +32823,9 @@ fn test_update_config_rejects_negative_funding_max_bps_per_slot() {
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    // Capture config snapshot before rejected operation
+    let config_before = env.read_update_config_snapshot();
 
     let ix = Instruction {
         program_id: env.program_id,
@@ -32816,6 +32845,9 @@ fn test_update_config_rejects_negative_funding_max_bps_per_slot() {
     );
     let result = env.svm.send_transaction(tx);
     assert!(result.is_err(), "Negative funding_max_bps_per_slot must be rejected");
+
+    // Config must be unchanged after rejection
+    assert_eq!(env.read_update_config_snapshot(), config_before, "config must be preserved after rejected UpdateConfig");
 }
 
 /// InitMarket must reject insurance_withdraw_max_bps > 10000.
@@ -32884,4 +32916,139 @@ fn test_init_market_insurance_withdraw_max_bps_bounded() {
     );
     let result = env.svm.send_transaction(tx);
     assert!(result.is_err(), "insurance_withdraw_max_bps > 10000 must be rejected");
+}
+
+// ============================================================================
+// Critical gap tests
+// ============================================================================
+
+/// InitMarket must reject a vault that already holds tokens.
+/// verify_vault_empty checks tok.amount == 0; a non-empty vault indicates
+/// pre-seeded funds that would desync engine accounting from day one.
+#[test]
+fn test_init_market_rejects_nonempty_vault() {
+    program_path();
+    let mut env = TestEnv::new();
+
+    // Modify the vault account to have a non-zero balance BEFORE init_market.
+    // TestEnv::new() creates the vault with amount=0; overwrite it with amount=1.
+    let (vault_pda, _) =
+        Pubkey::find_program_address(&[b"vault", env.slab.as_ref()], &env.program_id);
+    env.svm
+        .set_account(
+            env.vault,
+            Account {
+                lamports: 1_000_000,
+                data: make_token_account_data(&env.mint, &vault_pda, 1), // amount = 1
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    // Attempt InitMarket — should fail because vault is not empty
+    let admin = &env.payer;
+    let dummy_ata = Pubkey::new_unique();
+    env.svm
+        .set_account(
+            dummy_ata,
+            Account {
+                lamports: 1_000_000,
+                data: vec![0u8; TokenAccount::LEN],
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new_readonly(env.mint, false),
+            AccountMeta::new(env.vault, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+            AccountMeta::new_readonly(sysvar::rent::ID, false),
+            AccountMeta::new_readonly(dummy_ata, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        ],
+        data: encode_init_market_full_v2(&admin.pubkey(), &env.mint, &TEST_FEED_ID, 0, 0, 0),
+    };
+    let tx = Transaction::new_signed_with_payer(
+        &[cu_ix(), ix],
+        Some(&admin.pubkey()),
+        &[admin],
+        env.svm.latest_blockhash(),
+    );
+    let result = env.svm.send_transaction(tx);
+    assert!(
+        result.is_err(),
+        "InitMarket must reject vault with non-zero balance"
+    );
+}
+
+/// Resolved crank must forgive sub-scale dust, leaving dust_base == 0.
+/// This ensures CloseSlab can eventually succeed after resolution.
+#[test]
+fn test_resolved_crank_sweeps_dust_to_zero() {
+    program_path();
+    let mut env = TestEnv::new();
+
+    // Initialize with unit_scale=1000 (1000 base tokens = 1 engine unit)
+    env.init_market_full(0, 1000, 0);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+
+    // Deposit an amount that creates dust: 10_000_500 = 10_000 units + 500 dust
+    env.deposit(&user, user_idx, 10_000_500);
+
+    // Verify dust_base is non-zero (500 sub-scale remainder)
+    let read_dust_base = |svm: &LiteSVM, slab: &Pubkey| -> u64 {
+        let slab_data = svm.get_account(slab).unwrap().data;
+        // dust_base is at RESERVED_OFF(48) + 16 = offset 64 in slab
+        const DUST_BASE_OFF: usize = 64;
+        u64::from_le_bytes(
+            slab_data[DUST_BASE_OFF..DUST_BASE_OFF + 8]
+                .try_into()
+                .unwrap(),
+        )
+    };
+    let dust_after_deposit = read_dust_base(&env.svm, &env.slab);
+    assert_eq!(dust_after_deposit, 500, "Deposit should create 500 dust at unit_scale=1000");
+
+    // Advance slot and crank to settle state
+    env.set_slot(200);
+    env.crank();
+
+    // Close the user account so no positions remain
+    env.close_account(&user, user_idx);
+
+    // Dust should still be present after close_account (close returns units, not dust)
+    let dust_after_close = read_dust_base(&env.svm, &env.slab);
+    assert_eq!(dust_after_close, 500, "Dust should persist after close_account");
+
+    // Set oracle authority and push a settlement price for resolution
+    env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
+    env.try_push_oracle_price(&admin, 138_000_000, 200).unwrap();
+
+    // Resolve the market
+    env.try_resolve_market(&admin).unwrap();
+
+    // Crank the resolved market — should sweep/forgive dust
+    env.set_slot(300);
+    env.crank();
+
+    // dust_base must be zero after resolved crank
+    let dust_after_resolved_crank = read_dust_base(&env.svm, &env.slab);
+    assert_eq!(
+        dust_after_resolved_crank, 0,
+        "Resolved crank must forgive sub-scale dust, leaving dust_base == 0"
+    );
 }

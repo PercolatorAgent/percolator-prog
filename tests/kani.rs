@@ -615,18 +615,18 @@ fn kani_decide_trade_cpi_universal() {
     let pda_ok: bool = kani::any();
     let abi_ok: bool = kani::any();
     let user_auth_ok: bool = kani::any();
-    let lp_auth_ok: bool = kani::any();
+    let lp_key_ok: bool = kani::any();
     let gate_active: bool = kani::any();
     let risk_increase: bool = kani::any();
 
     let decision = decide_trade_cpi(
         old_nonce, shape, identity_ok, pda_ok, abi_ok,
-        user_auth_ok, lp_auth_ok, gate_active, risk_increase, exec_size,
+        user_auth_ok, lp_key_ok, gate_active, risk_increase, exec_size,
     );
 
     let should_accept = matcher_shape_ok(shape)
         && identity_ok && pda_ok && abi_ok
-        && user_auth_ok && lp_auth_ok
+        && user_auth_ok && lp_key_ok
         && !(gate_active && risk_increase);
 
     if should_accept {
