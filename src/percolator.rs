@@ -17026,7 +17026,9 @@ pub mod processor {
                 let engine = zc::engine_mut(&mut slab).unwrap();
                 engine.long_oi.set(long_oi);
                 engine.short_oi.set(short_oi);
-                engine.total_open_interest.set(long_oi.saturating_add(short_oi));
+                engine
+                    .total_open_interest
+                    .set(long_oi.saturating_add(short_oi));
             }
             let mut config = <state::MarketConfig as bytemuck::Zeroable>::zeroed();
             state::set_oi_imbalance_hard_block_bps(&mut config, threshold_bps);
@@ -17131,11 +17133,19 @@ pub mod processor {
             // Now set OI threshold — must not touch vol_alpha
             state::set_oi_imbalance_hard_block_bps(&mut c, 8_000);
             assert_eq!(state::get_oi_imbalance_hard_block_bps(&c), 8_000);
-            assert_eq!(state::get_vol_alpha_e6(&c), 50_000, "OI threshold write corrupted vol_alpha_e6");
+            assert_eq!(
+                state::get_vol_alpha_e6(&c),
+                50_000,
+                "OI threshold write corrupted vol_alpha_e6"
+            );
             // Change vol_alpha — must not touch OI threshold
             state::set_vol_alpha_e6(&mut c, 60_000);
             assert_eq!(state::get_vol_alpha_e6(&c), 60_000);
-            assert_eq!(state::get_oi_imbalance_hard_block_bps(&c), 8_000, "vol_alpha write corrupted OI hard block threshold");
+            assert_eq!(
+                state::get_oi_imbalance_hard_block_bps(&c),
+                8_000,
+                "vol_alpha write corrupted OI hard block threshold"
+            );
         }
     }
 }
