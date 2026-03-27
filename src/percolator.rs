@@ -744,10 +744,20 @@ pub mod zc {
     /// Offset of side_mode_short within RiskEngine (repr(u8) enum)
     const SM_SHORT_OFF: usize = offset_of!(RiskEngine, side_mode_short);
 
-    /// Validate SideMode discriminants from raw bytes BEFORE casting.
-    /// O(1) — only checks the two SideMode bytes (externally settable via
-    /// engine state). AccountKind is only written by add_user/add_lp so
-    /// invalid values require a program bug, not external corruption.
+    /// Validate enum discriminants from raw bytes BEFORE casting to &RiskEngine.
+    ///
+    /// RiskEngine contains two enum types:
+    ///   - SideMode (2 instances): validated here (O(1))
+    ///   - AccountKind (MAX_ACCOUNTS instances in accounts[]): NOT validated
+    ///
+    /// AccountKind soundness argument:
+    ///   1. InitMarket zeroes the entire slab → kind=0=AccountKind::User (valid)
+    ///   2. Only add_user (kind=0) and add_lp (kind=1) write the field
+    ///   3. Slab is program-owned → no external writes possible
+    ///   4. Therefore invalid AccountKind requires a program bug, not data corruption
+    ///
+    /// Validating all MAX_ACCOUNTS kind bytes would cost ~40-60k CU per call,
+    /// making KeeperCrank and TradeCpi exceed the 200k CU budget.
     #[inline]
     fn validate_raw_discriminants(data: &[u8]) -> Result<(), ProgramError> {
         let base = ENGINE_OFF;
@@ -3335,10 +3345,23 @@ pub mod processor {
 
                     for idx in start..end {
                         if engine.is_used(idx as usize) {
-                            // Best-effort settlement. On resolved markets the
-                            // settlement price is fixed, so partial state from a
-                            // failed touch converges on retry. Accounts that can
-                            // never be touched are handled by close_account_resolved.
+                            // Best-effort settlement at fixed settlement price.
+                            //
+                            // Convergence argument (verified in engine source):
+                            //   accrue_market_to writes last_oracle_price LAST,
+                            //   after all K coefficient updates. If K updates fail
+                            //   (checked arithmetic), stored price is NOT updated,
+                            //   so the next call recomputes the same delta_p. After
+                            //   a successful completion, subsequent calls with the
+                            //   same fixed price hit the early return (delta_p=0).
+                            //
+                            //   Therefore: partial failure → retry → identical
+                            //   final state as single success. Idempotent after
+                            //   first successful application.
+                            //
+                            // Accounts where touch never succeeds (ADL overflow)
+                            // are handled by close_account_resolved, which operates
+                            // on stored local state without accrue/settle.
                             let _ = engine.touch_account_full(
                                 idx as usize, settlement_price, clock.slot,
                             );
@@ -3977,9 +4000,15 @@ pub mod processor {
                     sol_log_compute_units();
                 }
                 let amt_units = if resolved {
-                    // close_account_resolved is designed for resolved/frozen markets
-                    // where touch_account_full may not be viable (ADL overflow).
-                    // Settlement should happen via resolved KeeperCrank before close.
+                    // close_account_resolved operates on stored local state without
+                    // calling accrue_market_to or settle_side_effects. Settlement
+                    // should happen via resolved KeeperCrank before close.
+                    //
+                    // If crank-time touch succeeded: account is fully settled.
+                    // If crank-time touch failed: convergence property guarantees
+                    //   next crank will complete it, OR close_account_resolved
+                    //   handles the account using best-available stored state
+                    //   (designed for ADL-overflow scenarios).
                     engine.close_account_resolved(user_idx)
                         .map_err(map_risk_error)?
                 } else {
