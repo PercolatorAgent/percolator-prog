@@ -95,12 +95,12 @@ pub mod constants {
 
 // Packed insurance-withdraw metadata in config.authority_timestamp (i64/u64):
 // [max_withdraw_bps:16][last_withdraw_slot:48]
-const INS_WITHDRAW_LAST_SLOT_MASK: u64 = (1u64 << 48) - 1;
+pub const INS_WITHDRAW_LAST_SLOT_MASK: u64 = (1u64 << 48) - 1;
 // Sentinel in the 48-bit slot field meaning "no successful limited withdraw yet".
 const INS_WITHDRAW_LAST_SLOT_NONE: u64 = INS_WITHDRAW_LAST_SLOT_MASK;
 
 #[inline]
-fn pack_ins_withdraw_meta(max_bps: u16, last_slot: u64) -> Option<i64> {
+pub fn pack_ins_withdraw_meta(max_bps: u16, last_slot: u64) -> Option<i64> {
     if max_bps == 0 || max_bps > 10_000 || last_slot > INS_WITHDRAW_LAST_SLOT_MASK {
         return None;
     }
@@ -109,7 +109,7 @@ fn pack_ins_withdraw_meta(max_bps: u16, last_slot: u64) -> Option<i64> {
 }
 
 #[inline]
-fn unpack_ins_withdraw_meta(packed: i64) -> (u16, u64) {
+pub fn unpack_ins_withdraw_meta(packed: i64) -> (u16, u64) {
     let raw = packed as u64;
     let max_bps = ((raw >> 48) & 0xFFFF) as u16;
     let last_slot = raw & INS_WITHDRAW_LAST_SLOT_MASK;
