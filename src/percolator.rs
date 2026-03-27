@@ -3869,25 +3869,30 @@ pub mod state {
     // PERC-8110: OI Imbalance Hard Block
     // ========================================
 
-    /// PERC-8110: Read OI imbalance hard block threshold from `_lp_col_pad[0..2]`.
+    /// PERC-8110: Read OI imbalance hard block threshold from `_lp_col_pad[4..6]`.
     ///
     /// Stored as little-endian u16 in padding bytes to avoid CONFIG_LEN changes.
     /// 0 = disabled (no hard block).
     /// 1-10_000 = max allowed |long_oi - short_oi| / total_oi in bps before new imbalance-
     /// increasing trades are rejected.
+    ///
+    /// Layout: [0..2] = vol_alpha_e6 (VRAM EWMA alpha), [2..4] = vol_margin_target_e6,
+    /// [4..6] = oi_imbalance_hard_block_bps (this field), [6] = free.
     #[inline]
     pub fn get_oi_imbalance_hard_block_bps(config: &MarketConfig) -> u16 {
-        u16::from_le_bytes([config._lp_col_pad[0], config._lp_col_pad[1]])
+        u16::from_le_bytes([config._lp_col_pad[4], config._lp_col_pad[5]])
     }
 
-    /// PERC-8110: Set OI imbalance hard block threshold into `_lp_col_pad[0..2]`.
+    /// PERC-8110: Set OI imbalance hard block threshold into `_lp_col_pad[4..6]`.
     /// Clamps to [0, 10_000].
+    ///
+    /// bytes [0..2] are reserved for vol_alpha_e6 — do not touch them here.
     #[inline]
     pub fn set_oi_imbalance_hard_block_bps(config: &mut MarketConfig, threshold_bps: u16) {
         let clamped = threshold_bps.min(10_000);
         let bytes = clamped.to_le_bytes();
-        config._lp_col_pad[0] = bytes[0];
-        config._lp_col_pad[1] = bytes[1];
+        config._lp_col_pad[4] = bytes[0];
+        config._lp_col_pad[5] = bytes[1];
     }
 
     // ========================================
@@ -17113,6 +17118,24 @@ pub mod processor {
             // Zero disables
             state::set_oi_imbalance_hard_block_bps(&mut c, 0);
             assert_eq!(state::get_oi_imbalance_hard_block_bps(&c), 0);
+        }
+
+        /// Regression: PERC-8110 uses _lp_col_pad[4..6]; vol_alpha_e6 uses [0..2].
+        /// Setting OI threshold must NOT corrupt VRAM alpha, and vice versa.
+        #[test]
+        fn test_oi_hard_block_no_storage_collision_with_vol_alpha() {
+            let mut c = <state::MarketConfig as bytemuck::Zeroable>::zeroed();
+            // Set vol_alpha_e6 first (u16, valid range 0..=65535; use 50_000 as sentinel)
+            state::set_vol_alpha_e6(&mut c, 50_000);
+            assert_eq!(state::get_vol_alpha_e6(&c), 50_000);
+            // Now set OI threshold — must not touch vol_alpha
+            state::set_oi_imbalance_hard_block_bps(&mut c, 8_000);
+            assert_eq!(state::get_oi_imbalance_hard_block_bps(&c), 8_000);
+            assert_eq!(state::get_vol_alpha_e6(&c), 50_000, "OI threshold write corrupted vol_alpha_e6");
+            // Change vol_alpha — must not touch OI threshold
+            state::set_vol_alpha_e6(&mut c, 60_000);
+            assert_eq!(state::get_vol_alpha_e6(&c), 60_000);
+            assert_eq!(state::get_oi_imbalance_hard_block_bps(&c), 8_000, "vol_alpha write corrupted OI hard block threshold");
         }
     }
 }
