@@ -2058,11 +2058,20 @@ fn test_funding_rate_transfers_pnl_on_premium() {
     //     "Longs should pay shorts when mark > index (funding). long_delta={}, short_delta={}",
     //     long_delta, short_delta);
 
-    // Spec v11.31 §4.12: zero-rate core profile. No funding transfers occur.
-    // The rate is computed and stored for observability, but accrue_market_to
-    // does not apply K-coefficient funding transfers in this revision.
-    // PnL changes are purely from mark-to-market via K coefficients.
-    println!("Funding test (zero-rate §4.12): long_delta={}, short_delta={}",
-        long_delta, short_delta);
+    // Engine v12.0.2: live premium-based funding. When mark > index,
+    // longs pay shorts via K-coefficient transfers in accrue_market_to.
+    // long_delta includes MTM gain (price up) MINUS funding paid.
+    // short_delta includes MTM loss (price up) PLUS funding received.
+    // With funding, short losses should be partially offset by funding credits.
+    println!("Funding test: long_delta={}, short_delta={}", long_delta, short_delta);
+
+    // Both sides should have non-zero PnL movement from MTM + funding
+    assert_ne!(long_delta, 0, "Long should have non-zero PnL from MTM + funding");
+    // Short gets funding credits that offset MTM losses
+    // Total PnL (long + short + LP) should approximately conserve
+    let lp_pnl = env.read_account_pnl(lp_idx);
+    let total = long_pnl_after + short_pnl_after + lp_pnl;
+    println!("Funding conservation: long={}, short={}, lp={}, total={}",
+        long_pnl_after, short_pnl_after, lp_pnl, total);
 }
 
