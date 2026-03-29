@@ -1933,3 +1933,40 @@ fn test_top_up_insurance_increases_balance() {
     );
 }
 
+/// Audit gap 3: Insurance floor is immutable after market initialization.
+///
+/// Spec behavior (ss2.2.1): insurance_floor is set at InitMarket and cannot
+/// be changed afterwards.  SetRiskThreshold (tag 11) was removed and must
+/// return InvalidInstructionData.  The stored insurance_floor must not change.
+#[test]
+fn test_insurance_floor_immutable_after_init() {
+    program_path();
+
+    let mut env = TestEnv::new();
+    let floor_value: u128 = 1_000_000_000; // 1 SOL floor
+    env.init_market_with_insurance_floor(0, floor_value);
+
+    // Verify insurance_floor was stored correctly at init
+    let floor_after_init = env.read_insurance_floor();
+    assert_eq!(
+        floor_after_init, floor_value,
+        "insurance_floor should be set to the init value"
+    );
+
+    // Attempt to change insurance_floor via SetRiskThreshold (tag 11)
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    let new_threshold: u128 = 5_000_000_000; // attempt to change to 5 SOL
+    let result = env.try_set_risk_threshold(&admin, new_threshold);
+    assert!(
+        result.is_err(),
+        "SetRiskThreshold must be rejected (insurance_floor is immutable per spec ss2.2.1)"
+    );
+
+    // Verify the floor has not changed
+    let floor_after_attempt = env.read_insurance_floor();
+    assert_eq!(
+        floor_after_attempt, floor_value,
+        "insurance_floor must remain unchanged after rejected SetRiskThreshold"
+    );
+}
+

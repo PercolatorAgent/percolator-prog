@@ -842,3 +842,108 @@ fn test_hyperp_index_smoothing_multiple_cranks_same_slot() {
     );
 }
 
+/// Audit gap 1: Hyperp index smoothing is rate-limited by cap_e2bps * dt.
+///
+/// Spec behavior: In Hyperp mode, the index (last_effective_price_e6) moves
+/// toward the mark price by at most `index * cap_e2bps * dt / 1_000_000` per
+/// crank.  A second crank in the same slot (dt=0) must leave the index unchanged.
+///
+/// This test:
+/// 1. Inits a Hyperp market at $100.
+/// 2. Pushes mark to ~$101 (clamped by circuit breaker from $200 push).
+/// 3. Cranks with dt=10 slots, verifies index movement <= cap * dt bound.
+/// 4. Cranks again in the same slot, verifies index is unchanged (dt=0).
+#[test]
+fn test_hyperp_index_smoothing_rate_limited() {
+    program_path();
+
+    let mut env = TestEnv::new();
+    let initial_price: u64 = 100_000_000; // $100 in e6
+
+    // Init Hyperp market (feed_id = [0;32], no external oracle)
+    env.init_market_hyperp(initial_price);
+
+    // Set oracle authority so we can push prices
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.try_set_oracle_authority(&admin, &admin.pubkey())
+        .expect("set oracle authority");
+
+    // Read default oracle_price_cap_e2bps (1% per slot = 10_000 e2bps)
+    let slab_data = env.svm.get_account(&env.slab).unwrap().data;
+    const CAP_OFF: usize = 72 + 304; // config offset + cap field offset
+    let cap_e2bps =
+        u64::from_le_bytes(slab_data[CAP_OFF..CAP_OFF + 8].try_into().unwrap());
+    assert_eq!(cap_e2bps, 10_000, "default cap should be 10_000 e2bps (1% per slot)");
+
+    // Push mark far away ($200). The circuit breaker clamps mark against index.
+    // Mark will be clamped to index + index*cap/1M = 100M + 100M*10000/1M = 101M
+    env.try_push_oracle_price(&admin, 200_000_000, 200)
+        .expect("push price");
+
+    // Verify mark was clamped (not $200)
+    let slab_data = env.svm.get_account(&env.slab).unwrap().data;
+    const MARK_OFF: usize = 72 + 288; // authority_price_e6
+    const INDEX_OFF: usize = 72 + 312; // last_effective_price_e6
+    let mark_after_push =
+        u64::from_le_bytes(slab_data[MARK_OFF..MARK_OFF + 8].try_into().unwrap());
+    let index_after_push =
+        u64::from_le_bytes(slab_data[INDEX_OFF..INDEX_OFF + 8].try_into().unwrap());
+
+    // Mark should be clamped to within 1% of index = $100M + $1M = $101M
+    assert!(
+        mark_after_push <= initial_price + initial_price * cap_e2bps / 1_000_000,
+        "mark should be clamped by circuit breaker: mark={} cap_bound={}",
+        mark_after_push,
+        initial_price + initial_price * cap_e2bps / 1_000_000
+    );
+    // Index should still be $100 (push doesn't move index in Hyperp)
+    assert_eq!(
+        index_after_push, initial_price,
+        "push should not move the index"
+    );
+
+    // Advance 10 slots and crank. Index should move toward mark by at most cap*dt.
+    let dt: u64 = 10;
+    env.set_slot(dt); // set_slot adds 100 internally for monotonicity
+    env.crank();
+
+    let slab_data = env.svm.get_account(&env.slab).unwrap().data;
+    let index_after_crank =
+        u64::from_le_bytes(slab_data[INDEX_OFF..INDEX_OFF + 8].try_into().unwrap());
+
+    // Max allowed movement: index * cap_e2bps * dt / 1_000_000
+    let max_delta = initial_price as u128 * cap_e2bps as u128 * dt as u128 / 1_000_000;
+    let actual_delta = if index_after_crank > initial_price {
+        (index_after_crank - initial_price) as u128
+    } else {
+        (initial_price - index_after_crank) as u128
+    };
+
+    assert!(
+        actual_delta <= max_delta,
+        "index movement {} exceeds rate limit {} (cap_e2bps={}, dt={})",
+        actual_delta, max_delta, cap_e2bps, dt
+    );
+    // Index should have moved (mark != index, dt > 0)
+    assert!(
+        index_after_crank > initial_price,
+        "index should have moved toward mark: index={} initial={}",
+        index_after_crank, initial_price
+    );
+
+    // Second crank in the same slot (dt=0): index must not change.
+    let index_before_same_slot = index_after_crank;
+    env.svm.expire_blockhash();
+    env.crank();
+
+    let slab_data = env.svm.get_account(&env.slab).unwrap().data;
+    let index_after_same_slot =
+        u64::from_le_bytes(slab_data[INDEX_OFF..INDEX_OFF + 8].try_into().unwrap());
+
+    assert_eq!(
+        index_after_same_slot, index_before_same_slot,
+        "same-slot crank must not move index: before={} after={}",
+        index_before_same_slot, index_after_same_slot
+    );
+}
+

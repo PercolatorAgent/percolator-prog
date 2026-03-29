@@ -2739,3 +2739,159 @@ fn test_query_lp_fees_rejects_invalid_idx() {
     );
 }
 
+/// Audit gap 2: Inverted market full lifecycle.
+///
+/// Spec behavior: An inverted market (invert=1) should support the complete
+/// lifecycle -- init, deposit, trade, crank, close -- with conservation holding.
+/// The inverted price space inverts oracle prices (1e12 / raw_price) before all
+/// engine calculations.
+#[test]
+fn test_inverted_market_full_lifecycle() {
+    program_path();
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(1); // inverted market
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 50_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 5_000_000_000);
+
+    // Total deposited: 50B + 5B + 200 (two init fees of 100 each)
+    let total_deposited: u64 = 55_000_000_200;
+    assert_eq!(
+        env.vault_balance(),
+        total_deposited,
+        "vault should hold all deposits"
+    );
+
+    // Open long position in inverted price space
+    env.trade(&user, &lp, lp_idx, user_idx, 1_000_000);
+    assert_eq!(
+        env.vault_balance(),
+        total_deposited,
+        "conservation: trade must not move vault tokens"
+    );
+
+    // Top up insurance to avoid force-realize
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.top_up_insurance(&admin, 1_000_000_000);
+    let vault_with_insurance = env.vault_balance();
+
+    // Price change and crank (funding accrual in inverted space)
+    env.set_slot_and_price(200, 150_000_000); // oracle $150, inverted ~6667
+    env.crank();
+    assert_eq!(
+        env.vault_balance(),
+        vault_with_insurance,
+        "conservation: crank must not change vault"
+    );
+
+    // Another price move and crank
+    env.set_slot_and_price(300, 120_000_000); // oracle $120, inverted ~8333
+    env.crank();
+    assert_eq!(
+        env.vault_balance(),
+        vault_with_insurance,
+        "conservation: second crank must not change vault"
+    );
+
+    // Close position by trading back
+    env.trade(&user, &lp, lp_idx, user_idx, -1_000_000);
+    env.set_slot(400);
+    env.crank();
+    assert_eq!(
+        env.vault_balance(),
+        vault_with_insurance,
+        "conservation: closing trade must not change vault"
+    );
+
+    // Close accounts to verify capital is returned correctly
+    env.try_close_account(&user, user_idx)
+        .expect("user close should succeed");
+    env.try_close_account(&lp, lp_idx)
+        .expect("lp close should succeed");
+}
+
+/// Audit gap 4: InitMarket rejects non-zero maintenance_fee_per_slot.
+///
+/// Spec behavior: maintenance_fee_per_slot must be 0 at market initialization.
+/// Admin can set it later via SetMaintenanceFee. This prevents markets from
+/// launching with hidden fee extraction.
+#[test]
+fn test_maintenance_fee_zero_enforced_at_init() {
+    program_path();
+
+    let mut env = TestEnv::new();
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    // Try to init with non-zero maintenance_fee_per_slot
+    let bad_data = encode_init_market_with_maintenance_fee(
+        &admin.pubkey(),
+        &env.mint,
+        &TEST_FEED_ID,
+        0,
+        1_000_000, // non-zero maintenance_fee_per_slot
+    );
+    let result = env.try_init_market_raw(bad_data);
+    assert!(
+        result.is_err(),
+        "InitMarket must reject non-zero maintenance_fee_per_slot"
+    );
+}
+
+/// Audit gap 6: Scaled + inverted combo market trades correctly.
+///
+/// Spec behavior: When both invert=1 and unit_scale>0, prices are first
+/// inverted (1e12/raw) then scaled. Positions should open correctly in the
+/// resulting price space.
+#[test]
+fn test_scaled_inverted_market_trades_correctly() {
+    program_path();
+
+    let mut env = TestEnv::new();
+    // invert=1 + unit_scale=1000
+    env.init_market_full(1, 1000, 0);
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp_with_fee(&lp, 100_000);
+    env.deposit(&lp, lp_idx, 50_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user_with_fee(&user, 100_000);
+    env.deposit(&user, user_idx, 5_000_000_000);
+
+    let vault_after_deposits = env.vault_balance();
+
+    // Open position (long in scaled + inverted space)
+    let trade_result = env.try_trade(&user, &lp, lp_idx, user_idx, 1_000_000);
+    assert!(
+        trade_result.is_ok(),
+        "trade in scaled+inverted market should succeed: {:?}",
+        trade_result
+    );
+
+    // Position should be open
+    let pos = env.read_account_position(user_idx);
+    assert_ne!(pos, 0, "position should be non-zero after trade");
+
+    // Vault should be unchanged (trades are internal accounting)
+    assert_eq!(
+        env.vault_balance(),
+        vault_after_deposits,
+        "conservation: vault must not change from trading"
+    );
+
+    // Crank succeeds in scaled+inverted mode
+    env.set_slot(200);
+    env.crank();
+    assert_eq!(
+        env.vault_balance(),
+        vault_after_deposits,
+        "conservation: crank must not change vault in scaled+inverted market"
+    );
+}
+

@@ -2413,3 +2413,116 @@ fn test_binary_market_complete_lifecycle_conservation() {
     println!("BINARY MARKET COMPLETE LIFECYCLE CONSERVATION: PASSED");
 }
 
+/// Audit gap 5: ADL conservation after liquidation.
+///
+/// Spec behavior: After a price crash liquidates an underwater user, the ADL
+/// mechanism redistributes losses across profitable counterparties. Through
+/// this entire process, conservation must hold:
+///   total capital + insurance = vault (no value created or destroyed).
+///
+/// Setup: 3 users + 1 LP. Two users go long, one short. Crash price so the
+/// longs go underwater.  Liquidate the most-underwater user.  Crank to trigger
+/// ADL.  Verify vault balance is unchanged (conservation).
+#[test]
+fn test_adl_conservation_after_liquidation() {
+    program_path();
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 100_000_000_000);
+
+    // User A: long
+    let user_a = Keypair::new();
+    let user_a_idx = env.init_user(&user_a);
+    env.deposit(&user_a, user_a_idx, 5_000_000_000);
+
+    // User B: long
+    let user_b = Keypair::new();
+    let user_b_idx = env.init_user(&user_b);
+    env.deposit(&user_b, user_b_idx, 5_000_000_000);
+
+    // User C: short (opposing)
+    let user_c = Keypair::new();
+    let user_c_idx = env.init_user(&user_c);
+    env.deposit(&user_c, user_c_idx, 5_000_000_000);
+
+    // Top up insurance so the protocol has a buffer
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.top_up_insurance(&admin, 2_000_000_000);
+    let vault_after_setup = env.vault_balance();
+
+    // Open positions
+    env.trade(&user_a, &lp, lp_idx, user_a_idx, 5_000_000);  // long
+    env.trade(&user_b, &lp, lp_idx, user_b_idx, 3_000_000);  // long
+    env.trade(&user_c, &lp, lp_idx, user_c_idx, -4_000_000); // short
+
+    // Trading is internal: vault unchanged
+    assert_eq!(
+        env.vault_balance(),
+        vault_after_setup,
+        "conservation after trades"
+    );
+
+    // Crash the price from $138 to $50 -- longs go deeply underwater
+    env.set_slot_and_price(200, 50_000_000);
+    env.crank();
+    assert_eq!(
+        env.vault_balance(),
+        vault_after_setup,
+        "conservation after crash crank"
+    );
+
+    // Attempt liquidation of user_a (largest long, most underwater)
+    let liq_result = env.try_liquidate(user_a_idx);
+    // Liquidation may or may not succeed depending on exact margin state,
+    // but the vault must remain conserved regardless.
+
+    // Crank to process any ADL or settlement
+    env.set_slot_and_price(300, 50_000_000);
+    env.crank();
+    assert_eq!(
+        env.vault_balance(),
+        vault_after_setup,
+        "conservation after liquidation + ADL crank"
+    );
+
+    // Additional crank cycle to catch any deferred settlement
+    env.set_slot_and_price(400, 50_000_000);
+    env.crank();
+    assert_eq!(
+        env.vault_balance(),
+        vault_after_setup,
+        "conservation: vault stable through full ADL cycle"
+    );
+
+    // Verify engine internal conservation:
+    // engine.vault == actual SPL vault balance
+    let engine_vault = env.read_engine_vault();
+    let actual_vault = env.vault_balance() as u128;
+    assert_eq!(
+        engine_vault, actual_vault,
+        "engine vault must match SPL vault: engine={} actual={}",
+        engine_vault, actual_vault
+    );
+
+    // The critical invariant is conservation, verified above.  Whether
+    // liquidation succeeded or the account was merely force-realized by the
+    // crank, the vault must remain unchanged.  Position reduction is a
+    // consequence of the liquidation path but the ADL epoch reset can make
+    // `read_account_position` return the old value until the next settlement
+    // touch, so we do not assert on the exact position value here.
+    //
+    // Instead, verify the user's capital was reduced (they took a loss).
+    if liq_result.is_ok() {
+        let cap_a = env.read_account_capital(user_a_idx);
+        assert!(
+            cap_a < 5_000_000_000,
+            "liquidated user's capital should be reduced from initial 5B: cap={}",
+            cap_a
+        );
+    }
+}
+
