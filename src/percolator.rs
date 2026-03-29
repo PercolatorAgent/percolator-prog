@@ -2564,9 +2564,141 @@ pub mod processor {
         zc,
     };
     use percolator::{
-        RiskEngine, RiskError, MAX_ACCOUNTS,
+        RiskEngine, RiskError, I128, U128, ADL_ONE, MAX_ACCOUNTS,
     };
 
+    /// Settle a same-epoch account for resolved-market close.
+    ///
+    /// When `close_account` fails (same-epoch position not zeroed by touch),
+    /// this function zeros the position, settles PnL, and prepares the
+    /// account so that `close_account_resolved` can succeed.
+    ///
+    /// Replicates the old `force_close_resolved` logic that was removed
+    /// from the engine. Directly manipulates engine fields to maintain
+    /// aggregate invariants (stored_pos_count, pnl_pos_tot, c_tot, etc.).
+    fn settle_and_close_resolved(engine: &mut RiskEngine, idx: u16) -> Result<u128, RiskError> {
+        let i = idx as usize;
+        if i >= MAX_ACCOUNTS || !engine.is_used(i) {
+            return Err(RiskError::AccountNotFound);
+        }
+
+        // Step 1: Zero position with stored_pos_count maintenance
+        let basis = engine.accounts[i].position_basis_q;
+        if basis != 0 {
+            if basis > 0 {
+                engine.stored_pos_count_long = engine.stored_pos_count_long
+                    .checked_sub(1).ok_or(RiskError::Overflow)?;
+            } else {
+                engine.stored_pos_count_short = engine.stored_pos_count_short
+                    .checked_sub(1).ok_or(RiskError::Overflow)?;
+            }
+            engine.accounts[i].position_basis_q = 0;
+            engine.accounts[i].adl_a_basis = ADL_ONE;
+            engine.accounts[i].adl_k_snap = 0;
+            engine.accounts[i].adl_epoch_snap = 0;
+        }
+
+        // Step 2: Settle losses (negative PnL → capital)
+        let pnl = engine.accounts[i].pnl;
+        if pnl < 0 {
+            let need = if pnl == i128::MIN { i128::MAX as u128 + 1 } else { pnl.unsigned_abs() };
+            let cap = engine.accounts[i].capital.get();
+            let pay = core::cmp::min(need, cap);
+            if pay > 0 {
+                // set_capital inline: update c_tot and account capital
+                let new_cap = cap - pay;
+                let old_c_tot = engine.c_tot.get();
+                engine.c_tot = U128::new(old_c_tot.saturating_sub(cap).saturating_add(new_cap));
+                engine.accounts[i].capital = U128::new(new_cap);
+                // set_pnl inline: update aggregates
+                let pay_i128 = pay as i128;
+                let new_pnl = pnl.saturating_add(pay_i128);
+                // old pnl < 0, so no pnl_pos_tot change
+                engine.accounts[i].pnl = new_pnl;
+            }
+        }
+
+        // Step 3: Absorb any remaining negative PnL as protocol loss
+        if engine.accounts[i].pnl < 0 {
+            let loss = engine.accounts[i].pnl.unsigned_abs();
+            // absorb_protocol_loss: deduct from insurance fund
+            let ins_bal = engine.insurance_fund.balance.get();
+            let available = ins_bal.saturating_sub(engine.insurance_floor);
+            let ins_pay = core::cmp::min(loss, available);
+            if ins_pay > 0 {
+                engine.insurance_fund.balance = U128::new(ins_bal - ins_pay);
+            }
+            // Zero the PnL (was negative, no pnl_pos_tot impact)
+            engine.accounts[i].pnl = 0;
+        }
+
+        // Step 4: Convert positive PnL to capital (bypass warmup for resolved)
+        if engine.accounts[i].pnl > 0 {
+            let pos_pnl = engine.accounts[i].pnl as u128;
+
+            // Release all reserves (bypass warmup)
+            let old_reserved = engine.accounts[i].reserved_pnl;
+            if old_reserved > 0 {
+                // Update pnl_matured_pos_tot: matured increases by released amount
+                let matured_delta = core::cmp::min(old_reserved, pos_pnl);
+                engine.pnl_matured_pos_tot = engine.pnl_matured_pos_tot
+                    .saturating_add(matured_delta);
+                engine.accounts[i].reserved_pnl = 0;
+            }
+
+            // Compute haircutted payout
+            let (h_num, h_den) = engine.haircut_ratio();
+            let y = if h_den == 0 {
+                pos_pnl
+            } else {
+                // wide_mul_div_floor: (pos_pnl * h_num) / h_den
+                let num = (pos_pnl as u128).checked_mul(h_num).unwrap_or(u128::MAX);
+                num / h_den
+            };
+
+            // consume_released_pnl: decrease PnL and aggregates
+            // set_pnl to 0: remove pos_pnl from pnl_pos_tot
+            engine.pnl_pos_tot = engine.pnl_pos_tot.saturating_sub(pos_pnl);
+            // Also decrease pnl_matured_pos_tot
+            engine.pnl_matured_pos_tot = engine.pnl_matured_pos_tot
+                .saturating_sub(pos_pnl);
+            engine.accounts[i].pnl = 0;
+            engine.accounts[i].reserved_pnl = 0;
+
+            // set_capital: add haircutted payout to capital
+            let old_cap = engine.accounts[i].capital.get();
+            let new_cap = old_cap.saturating_add(y);
+            let old_c_tot = engine.c_tot.get();
+            engine.c_tot = U128::new(old_c_tot.saturating_sub(old_cap).saturating_add(new_cap));
+            engine.accounts[i].capital = U128::new(new_cap);
+        }
+
+        // Step 5: Fee debt sweep
+        {
+            let fc = engine.accounts[i].fee_credits.get();
+            if fc < 0 {
+                let debt = fc.unsigned_abs();
+                let cap = engine.accounts[i].capital.get();
+                let pay = core::cmp::min(debt, cap);
+                if pay > 0 {
+                    let new_cap = cap - pay;
+                    let old_c_tot = engine.c_tot.get();
+                    engine.c_tot = U128::new(old_c_tot.saturating_sub(cap).saturating_add(new_cap));
+                    engine.accounts[i].capital = U128::new(new_cap);
+                    let pay_i128 = core::cmp::min(pay, i128::MAX as u128) as i128;
+                    engine.accounts[i].fee_credits = I128::new(
+                        fc.checked_add(pay_i128).unwrap_or(0)
+                    );
+                    engine.insurance_fund.balance = U128::new(
+                        engine.insurance_fund.balance.get().saturating_add(pay)
+                    );
+                }
+            }
+        }
+
+        // Now position==0 and pnl==0, delegate to close_account_resolved
+        engine.close_account_resolved(idx)
+    }
 
     /// Result of a successful trade execution from the matching engine
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4145,7 +4277,7 @@ pub mod processor {
                     let frozen_slot = config.resolution_slot;
                     let funding_rate = compute_current_funding_rate(&config);
                     engine.close_account(user_idx, frozen_slot, price, funding_rate)
-                        .or_else(|_| engine.force_close_resolved(user_idx))
+                        .or_else(|_| settle_and_close_resolved(engine, user_idx))
                         .map_err(map_risk_error)?
                 } else {
                     engine
@@ -5059,19 +5191,19 @@ pub mod processor {
                 verify_token_account(a_owner_ata, &owner_pubkey, &mint)?;
 
                 // Best-effort touch to settle K-pair PnL at settlement price.
-                // May fail for same-epoch accounts — that's fine, force_close_resolved
-                // handles settlement independently.
+                // May fail for same-epoch accounts — that's fine,
+                // settle_and_close_resolved handles settlement independently.
                 let frozen_slot = config.resolution_slot;
                 let _ = engine.touch_account_full(user_idx as usize, price, frozen_slot);
 
                 // Try canonical close first (handles stale-epoch accounts
                 // where touch_account_full already zeroed the position).
-                // If that fails, fall back to force_close_resolved which
+                // If that fails, fall back to settle_and_close_resolved which
                 // zeroes position, settles PnL, and closes.
                 let funding_rate = compute_current_funding_rate(&config);
                 let amt_units = engine.close_account(
                     user_idx, frozen_slot, price, funding_rate,
-                ).or_else(|_| engine.force_close_resolved(user_idx))
+                ).or_else(|_| settle_and_close_resolved(engine, user_idx))
                     .map_err(map_risk_error)?;
                 let amt_units_u64: u64 = amt_units
                     .try_into()
