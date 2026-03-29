@@ -11702,6 +11702,25 @@ pub mod processor {
                     return Err(ProgramError::InvalidArgument);
                 }
 
+                // SECURITY (PERC-8191 / GH#1829): Prevent admin from setting cap=0 on
+                // non-Hyperp admin-oracle markets. cap=0 bypasses the circuit breaker
+                // entirely (clamp_toward_with_dt treats 0 as unlimited). Pyth-pinned
+                // markets are immune (oracle_authority is zeroed, staleness guards hold).
+                // Hyperp markets are guarded above. Only admin-oracle markets need this
+                // additional floor.
+                let is_hyperp = oracle::is_hyperp_mode(&config);
+                let is_pyth_pinned = crate::verify::is_pyth_pinned_mode(
+                    config.oracle_authority,
+                    config.index_feed_id,
+                );
+                if !is_hyperp && !is_pyth_pinned && max_change_e2bps == 0 {
+                    msg!(
+                        "SetOracleCap: admin-oracle markets require cap_e2bps > 0 (got 0); \
+                         cap=0 disables the circuit breaker"
+                    );
+                    return Err(ProgramError::InvalidArgument);
+                }
+
                 config.oracle_price_cap_e2bps = max_change_e2bps;
                 state::write_config(&mut data, &config);
             }

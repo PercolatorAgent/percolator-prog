@@ -3939,6 +3939,55 @@ fn test_critical_set_oracle_price_cap_authorization() {
 }
 
 // ============================================================================
+// Test: SetOraclePriceCap zero-cap floor (PERC-8191 / GH#1829)
+// ============================================================================
+
+/// SECURITY MEDIUM (PERC-8191): SetOraclePriceCap must reject cap=0 on
+/// admin-oracle markets. cap=0 would bypass the circuit breaker entirely.
+/// Hyperp markets and Pyth-pinned markets are not affected (guarded elsewhere).
+#[test]
+fn test_security_set_oracle_price_cap_zero_floor_admin_oracle() {
+    let path = program_path();
+    if !path.exists() {
+        println!("SKIP: BPF not found. Run: cargo build-sbf");
+        return;
+    }
+
+    let mut env = TestEnv::new();
+    // init_market_with_invert creates an admin-oracle market (non-Hyperp, non-Pyth-pinned)
+    env.init_market_with_invert(0);
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    // cap=0 must be rejected for admin-oracle markets (PERC-8191)
+    let result = env.try_set_oracle_price_cap(&admin, 0);
+    assert!(
+        result.is_err(),
+        "SECURITY PERC-8191: cap=0 must be rejected for admin-oracle markets (circuit breaker bypass)"
+    );
+    println!("SetOraclePriceCap cap=0 on admin-oracle: REJECTED (correct)");
+
+    // cap=1 must be accepted
+    let result = env.try_set_oracle_price_cap(&admin, 1);
+    assert!(
+        result.is_ok(),
+        "SetOraclePriceCap cap=1 should be accepted: {:?}",
+        result
+    );
+    println!("SetOraclePriceCap cap=1 on admin-oracle: ACCEPTED (correct)");
+
+    // cap=50000 (default DEX cap) must be accepted
+    let result = env.try_set_oracle_price_cap(&admin, 50_000);
+    assert!(
+        result.is_ok(),
+        "SetOraclePriceCap cap=50000 should be accepted: {:?}",
+        result
+    );
+    println!("SetOraclePriceCap cap=50000 on admin-oracle: ACCEPTED (correct)");
+
+    println!("SECURITY TEST PASSED: SetOraclePriceCap cap=0 floor enforced on admin-oracle markets (PERC-8191)");
+}
+
+// ============================================================================
 // Test: SetMaintenanceFee authorization
 // ============================================================================
 
