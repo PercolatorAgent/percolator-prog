@@ -2067,6 +2067,7 @@ impl TestEnv {
             accounts: vec![
                 AccountMeta::new(admin.pubkey(), true),
                 AccountMeta::new(self.slab, false),
+                AccountMeta::new_readonly(sysvar::clock::ID, false),
             ],
             data: encode_resolve_market(),
         };
@@ -2934,6 +2935,7 @@ impl TradeCpiTestEnv {
             accounts: vec![
                 AccountMeta::new(admin.pubkey(), true),
                 AccountMeta::new(self.slab, false),
+                AccountMeta::new_readonly(sysvar::clock::ID, false),
             ],
             data: encode_resolve_market(),
         };

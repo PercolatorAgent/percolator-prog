@@ -235,21 +235,21 @@ fn test_bug4_fee_overpayment_should_be_handled() {
         engine_vault, vault_after
     );
 
-    // Current behavior: InitUser deposits the full fee_payment as capital via
-    // engine.deposit(). The new_account_fee config field is NOT deducted during
-    // InitUser — all tokens go to the user's capital.
+    // Current behavior: InitUser deposits the full fee_payment into the vault,
+    // then charges new_account_fee from capital → insurance.
+    // So capital = fee_payment - new_account_fee, insurance = new_account_fee.
     let user_idx = _user_idx;
     let user_capital = env.read_account_capital(user_idx);
     let insurance = env.read_insurance_balance();
 
     assert_eq!(
-        insurance, 0,
-        "Insurance should be zero (no fee deduction in InitUser), got {}",
+        insurance, 1000,
+        "Insurance should equal new_account_fee (1000), got {}",
         insurance
     );
     assert_eq!(
-        user_capital, 5000,
-        "Full fee_payment should be credited to user capital, got {}",
+        user_capital, 4000,
+        "User capital should be fee_payment - new_account_fee (5000 - 1000 = 4000), got {}",
         user_capital
     );
 

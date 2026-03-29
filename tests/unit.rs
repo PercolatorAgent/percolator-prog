@@ -575,6 +575,7 @@ fn test_deposit_withdraw() {
             user_ata.to_info(),
             f.vault.to_info(),
             f.token_prog.to_info(),
+            f.clock.to_info(),
         ];
         process_instruction(&f.program_id, &accounts, &encode_init_user(0)).unwrap();
     }
@@ -684,6 +685,7 @@ fn test_trade() {
             user_ata.to_info(),
             f.vault.to_info(),
             f.token_prog.to_info(),
+            f.clock.to_info(),
         ];
         process_instruction(&f.program_id, &accounts, &encode_init_user(0)).unwrap();
     }
@@ -725,6 +727,7 @@ fn test_trade() {
             lp_ata.to_info(),
             f.vault.to_info(),
             f.token_prog.to_info(),
+            f.clock.to_info(),
         ];
         process_instruction(
             &f.program_id,
@@ -805,6 +808,7 @@ fn test_withdraw_wrong_signer() {
             user_ata.to_info(),
             f.vault.to_info(),
             f.token_prog.to_info(),
+            f.clock.to_info(),
         ];
         process_instruction(&f.program_id, &accounts, &encode_init_user(0)).unwrap();
     }
@@ -899,6 +903,7 @@ fn test_trade_wrong_signer() {
             user_ata.to_info(),
             f.vault.to_info(),
             f.token_prog.to_info(),
+            f.clock.to_info(),
         ];
         process_instruction(&f.program_id, &accs, &encode_init_user(0)).unwrap();
     }
@@ -929,6 +934,7 @@ fn test_trade_wrong_signer() {
             lp_ata.to_info(),
             f.vault.to_info(),
             f.token_prog.to_info(),
+            f.clock.to_info(),
         ];
         process_instruction(
             &f.program_id,
@@ -1034,6 +1040,7 @@ fn test_trade_cpi_wrong_pda_key_rejected() {
             user_ata.to_info(),
             f.vault.to_info(),
             f.token_prog.to_info(),
+            f.clock.to_info(),
         ];
         process_instruction(&f.program_id, &accs, &encode_init_user(0)).unwrap();
     }
@@ -1067,6 +1074,7 @@ fn test_trade_cpi_wrong_pda_key_rejected() {
             lp_ata.to_info(),
             f.vault.to_info(),
             f.token_prog.to_info(),
+            f.clock.to_info(),
         ];
         process_instruction(
             &f.program_id,
@@ -1144,6 +1152,7 @@ fn test_trade_cpi_wrong_lp_owner_rejected() {
             user_ata.to_info(),
             f.vault.to_info(),
             f.token_prog.to_info(),
+            f.clock.to_info(),
         ];
         process_instruction(&f.program_id, &accs, &encode_init_user(0)).unwrap();
     }
@@ -1177,6 +1186,7 @@ fn test_trade_cpi_wrong_lp_owner_rejected() {
             lp_ata.to_info(),
             f.vault.to_info(),
             f.token_prog.to_info(),
+            f.clock.to_info(),
         ];
         process_instruction(
             &f.program_id,
@@ -1262,6 +1272,7 @@ fn test_trade_cpi_wrong_oracle_key_rejected() {
             user_ata.to_info(),
             f.vault.to_info(),
             f.token_prog.to_info(),
+            f.clock.to_info(),
         ];
         process_instruction(&f.program_id, &accs, &encode_init_user(0)).unwrap();
     }
@@ -1295,6 +1306,7 @@ fn test_trade_cpi_wrong_oracle_key_rejected() {
             lp_ata.to_info(),
             f.vault.to_info(),
             f.token_prog.to_info(),
+            f.clock.to_info(),
         ];
         process_instruction(
             &f.program_id,
@@ -1495,6 +1507,7 @@ fn test_crank_updates_threshold_from_risk_metric() {
             user_ata.to_info(),
             f.vault.to_info(),
             f.token_prog.to_info(),
+            f.clock.to_info(),
         ];
         process_instruction(&f.program_id, &accs, &encode_init_user(0)).unwrap();
     }
@@ -1526,6 +1539,7 @@ fn test_crank_updates_threshold_from_risk_metric() {
             lp_ata.to_info(),
             f.vault.to_info(),
             f.token_prog.to_info(),
+            f.clock.to_info(),
         ];
         process_instruction(
             &f.program_id,
@@ -1768,6 +1782,7 @@ fn test_permissionless_crank_gc() {
             user_ata.to_info(),
             f.vault.to_info(),
             f.token_prog.to_info(),
+            f.clock.to_info(),
         ];
         process_instruction(&f.program_id, &accounts, &encode_init_user(100)).unwrap();
     }
@@ -1891,6 +1906,7 @@ fn test_permissionless_funding_not_controllable() {
             user_ata.to_info(),
             f.vault.to_info(),
             f.token_prog.to_info(),
+            f.clock.to_info(),
         ];
         process_instruction(&f.program_id, &accounts, &encode_init_user(100)).unwrap();
     }
@@ -2347,6 +2363,7 @@ fn test_withdraw_misalignment_rejected() {
             user_ata.to_info(),
             f.vault.to_info(),
             f.token_prog.to_info(),
+            f.clock.to_info(),
         ];
         process_instruction(&f.program_id, &accounts, &encode_init_user(1000)).unwrap();
     }
@@ -2477,6 +2494,7 @@ fn test_vault_amount_matches_engine_vault_plus_dust() {
             user_ata.to_info(),
             f.vault.to_info(),
             f.token_prog.to_info(),
+            f.clock.to_info(),
         ];
         process_instruction(&f.program_id, &accounts, &encode_init_user(0)).unwrap();
     }
@@ -2599,6 +2617,7 @@ fn test_engine_vault_equals_insurance_plus_capital_when_no_fees() {
             user1_ata.to_info(),
             f.vault.to_info(),
             f.token_prog.to_info(),
+            f.clock.to_info(),
         ];
         process_instruction(&f.program_id, &accounts, &encode_init_user(0)).unwrap();
     }
@@ -2625,6 +2644,7 @@ fn test_engine_vault_equals_insurance_plus_capital_when_no_fees() {
             user2_ata.to_info(),
             f.vault.to_info(),
             f.token_prog.to_info(),
+            f.clock.to_info(),
         ];
         process_instruction(&f.program_id, &accounts, &encode_init_user(0)).unwrap();
     }
@@ -2725,6 +2745,7 @@ fn test_withdraw_preserves_vault_accounting_invariant() {
             user_ata.to_info(),
             f.vault.to_info(),
             f.token_prog.to_info(),
+            f.clock.to_info(),
         ];
         process_instruction(&f.program_id, &accounts, &encode_init_user(0)).unwrap();
     }
@@ -2865,6 +2886,7 @@ fn test_dust_sweep_preserves_real_to_accounted_equality() {
             user_ata.to_info(),
             f.vault.to_info(),
             f.token_prog.to_info(),
+            f.clock.to_info(),
         ];
         process_instruction(&f.program_id, &accounts, &encode_init_user(0)).unwrap();
     }
@@ -3015,6 +3037,7 @@ fn test_invariants_with_unit_scale_zero() {
             user_ata.to_info(),
             f.vault.to_info(),
             f.token_prog.to_info(),
+            f.clock.to_info(),
         ];
         process_instruction(&f.program_id, &accounts, &encode_init_user(0)).unwrap();
     }

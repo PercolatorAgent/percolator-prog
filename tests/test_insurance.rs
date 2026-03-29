@@ -1360,12 +1360,12 @@ fn test_attack_new_account_fee_goes_to_insurance() {
         .expect("init_lp with fee failed");
     env.account_count += 1;
 
-    // Current behavior: InitLP deposits all fee_payment as capital via
-    // engine.deposit(). No new_account_fee deduction to insurance.
+    // Current behavior: InitLP charges new_account_fee from capital → insurance.
     let insurance_after_lp = env.read_insurance_balance();
     assert_eq!(
-        insurance_after_lp, insurance_before,
-        "Insurance unchanged (no fee deduction in InitLP): before={} after={}",
+        insurance_after_lp,
+        insurance_before + fee as u128,
+        "Insurance should grow by new_account_fee after InitLP: before={} after={}",
         insurance_before,
         insurance_after_lp
     );
@@ -1399,20 +1399,22 @@ fn test_attack_new_account_fee_goes_to_insurance() {
         .expect("init_user with fee failed");
     env.account_count += 1;
 
-    // Same for InitUser: no fee deduction to insurance
+    // InitUser also charges new_account_fee from capital → insurance
     let insurance_after_user = env.read_insurance_balance();
     assert_eq!(
-        insurance_after_user, insurance_after_lp,
-        "Insurance unchanged by InitUser: before={} after={}",
+        insurance_after_user,
+        insurance_after_lp + fee as u128,
+        "Insurance should grow by new_account_fee after InitUser: before={} after={}",
         insurance_after_lp,
         insurance_after_user
     );
 
-    // Insurance should not have grown (fees go to capital, not insurance)
+    // Insurance should have grown by 2x fee (one for LP, one for user)
     let growth = insurance_after_user - insurance_before;
     assert_eq!(
-        growth, 0,
-        "Insurance should not grow from init fees (goes to capital): growth={}",
+        growth,
+        2 * fee as u128,
+        "Insurance should grow by 2x new_account_fee: growth={}",
         growth
     );
 }

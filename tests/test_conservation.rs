@@ -1664,13 +1664,13 @@ fn test_attack_init_user_fee_conservation() {
         .send_transaction(tx)
         .expect("init_user with fee failed");
 
-    // Current behavior: InitUser deposits all fee_payment as capital via
-    // engine.deposit(). No new_account_fee deduction to insurance.
+    // Current behavior: InitUser deposits fee_payment as capital via
+    // engine.deposit(), then charges new_account_fee from capital → insurance.
     let insurance = env.read_insurance_balance();
     assert_eq!(
-        insurance, 0,
-        "Insurance unchanged (no fee deduction in InitUser): got {}",
-        insurance
+        insurance, new_account_fee,
+        "Insurance should equal new_account_fee ({}): got {}",
+        new_account_fee, insurance
     );
 
     // Verify SPL vault == engine vault (conservation)

@@ -387,7 +387,7 @@ impl TestEnv {
 
     fn init_lp(&mut self, owner: &Keypair) -> u16 {
         self.svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
-        let ata = self.create_ata(&owner.pubkey(), 0);
+        let ata = self.create_ata(&owner.pubkey(), 100);
         let matcher = spl_token::ID;
         let ctx = Pubkey::new_unique();
         self.svm
@@ -415,7 +415,7 @@ impl TestEnv {
                 AccountMeta::new_readonly(matcher, false),
                 AccountMeta::new_readonly(ctx, false),
             ],
-            data: encode_init_lp(&matcher, &ctx, 0),
+            data: encode_init_lp(&matcher, &ctx, 100),
         };
 
         let tx = Transaction::new_signed_with_payer(
@@ -430,7 +430,7 @@ impl TestEnv {
 
     fn init_user(&mut self, owner: &Keypair) -> u16 {
         self.svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
-        let ata = self.create_ata(&owner.pubkey(), 0);
+        let ata = self.create_ata(&owner.pubkey(), 100);
 
         let ix = Instruction {
             program_id: self.program_id,
@@ -443,7 +443,7 @@ impl TestEnv {
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
                 AccountMeta::new_readonly(self.pyth_col, false),
             ],
-            data: encode_init_user(0),
+            data: encode_init_user(100),
         };
 
         let tx = Transaction::new_signed_with_payer(
@@ -754,7 +754,7 @@ fn create_users(env: &mut TestEnv, count: usize, deposit_amount: u64) -> Vec<Key
     for i in 0..count {
         let user = Keypair::new();
         env.svm.airdrop(&user.pubkey(), 1_000_000_000).unwrap();
-        let ata = env.create_ata(&user.pubkey(), 0);
+        let ata = env.create_ata(&user.pubkey(), 100);
 
         let ix = Instruction {
             program_id: env.program_id,
@@ -767,7 +767,7 @@ fn create_users(env: &mut TestEnv, count: usize, deposit_amount: u64) -> Vec<Key
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
                 AccountMeta::new_readonly(env.pyth_col, false),
             ],
-            data: encode_init_user(0),
+            data: encode_init_user(100),
         };
         let tx = Transaction::new_signed_with_payer(
             &[cu_ix(), ix],
@@ -850,7 +850,7 @@ fn benchmark_worst_case_scenarios() {
         for i in 0..(MAX_ACCOUNTS - 1) {
             let user = Keypair::new();
             env.svm.airdrop(&user.pubkey(), 1_000_000_000).unwrap();
-            let ata = env.create_ata(&user.pubkey(), 0);
+            let ata = env.create_ata(&user.pubkey(), 100);
 
             let ix = Instruction {
                 program_id: env.program_id,
@@ -863,7 +863,7 @@ fn benchmark_worst_case_scenarios() {
                     AccountMeta::new_readonly(sysvar::clock::ID, false),
                     AccountMeta::new_readonly(env.pyth_col, false),
                 ],
-                data: encode_init_user(0),
+                data: encode_init_user(100),
             };
             let tx = Transaction::new_signed_with_payer(
                 &[cu_ix(), ix],
@@ -917,7 +917,7 @@ fn benchmark_worst_case_scenarios() {
             for i in 0..num_users {
                 let user = Keypair::new();
                 env.svm.airdrop(&user.pubkey(), 1_000_000_000).unwrap();
-                let ata = env.create_ata(&user.pubkey(), 0);
+                let ata = env.create_ata(&user.pubkey(), 100);
 
                 let ix = Instruction {
                     program_id: env.program_id,
@@ -930,7 +930,7 @@ fn benchmark_worst_case_scenarios() {
                         AccountMeta::new_readonly(sysvar::clock::ID, false),
                         AccountMeta::new_readonly(env.pyth_col, false),
                     ],
-                    data: encode_init_user(0),
+                    data: encode_init_user(100),
                 };
                 let tx = Transaction::new_signed_with_payer(
                     &[cu_ix(), ix],
@@ -1140,7 +1140,7 @@ fn benchmark_worst_case_scenarios() {
             for i in 0..num_users {
                 let user = Keypair::new();
                 env.svm.airdrop(&user.pubkey(), 1_000_000_000).unwrap();
-                let ata = env.create_ata(&user.pubkey(), 0);
+                let ata = env.create_ata(&user.pubkey(), 100);
 
                 let ix = Instruction {
                     program_id: env.program_id,
@@ -1153,7 +1153,7 @@ fn benchmark_worst_case_scenarios() {
                         AccountMeta::new_readonly(sysvar::clock::ID, false),
                         AccountMeta::new_readonly(env.pyth_col, false),
                     ],
-                    data: encode_init_user(0),
+                    data: encode_init_user(100),
                 };
                 let tx = Transaction::new_signed_with_payer(
                     &[cu_ix(), ix],
@@ -1254,7 +1254,7 @@ fn benchmark_worst_case_scenarios() {
             for i in 0..num_users {
                 let user = Keypair::new();
                 env.svm.airdrop(&user.pubkey(), 1_000_000_000).unwrap();
-                let ata = env.create_ata(&user.pubkey(), 0);
+                let ata = env.create_ata(&user.pubkey(), 100);
 
                 let ix = Instruction {
                     program_id: env.program_id,
@@ -1267,7 +1267,7 @@ fn benchmark_worst_case_scenarios() {
                         AccountMeta::new_readonly(sysvar::clock::ID, false),
                         AccountMeta::new_readonly(env.pyth_col, false),
                     ],
-                    data: encode_init_user(0),
+                    data: encode_init_user(100),
                 };
                 let tx = Transaction::new_signed_with_payer(
                     &[cu_ix(), ix],
@@ -1359,7 +1359,7 @@ fn benchmark_worst_case_scenarios() {
             for i in 0..num_users {
                 let user = Keypair::new();
                 env.svm.airdrop(&user.pubkey(), 1_000_000_000).unwrap();
-                let ata = env.create_ata(&user.pubkey(), 0);
+                let ata = env.create_ata(&user.pubkey(), 100);
 
                 let ix = Instruction {
                     program_id: env.program_id,
@@ -1372,7 +1372,7 @@ fn benchmark_worst_case_scenarios() {
                         AccountMeta::new_readonly(sysvar::clock::ID, false),
                         AccountMeta::new_readonly(env.pyth_col, false),
                     ],
-                    data: encode_init_user(0),
+                    data: encode_init_user(100),
                 };
                 let tx = Transaction::new_signed_with_payer(
                     &[cu_ix(), ix],
@@ -1512,7 +1512,7 @@ fn benchmark_worst_case_scenarios() {
             env.svm.airdrop(&user.pubkey(), 1_000_000_000).unwrap();
 
             // Create ATA (fee=0 since new_account_fee in params is 0)
-            let ata = env.create_ata(&user.pubkey(), 0);
+            let ata = env.create_ata(&user.pubkey(), 100);
 
             let ix = Instruction {
                 program_id: env.program_id,
@@ -1525,7 +1525,7 @@ fn benchmark_worst_case_scenarios() {
                     AccountMeta::new_readonly(sysvar::clock::ID, false),
                     AccountMeta::new_readonly(env.pyth_col, false),
                 ],
-                data: encode_init_user(0),
+                data: encode_init_user(100),
             };
             let tx = Transaction::new_signed_with_payer(
                 &[cu_ix(), ix],
@@ -2003,6 +2003,7 @@ fn benchmark_all_instructions() {
             accounts: vec![
                 AccountMeta::new(admin.pubkey(), true),
                 AccountMeta::new(env.slab, false),
+                AccountMeta::new_readonly(sysvar::clock::ID, false),
             ],
             data: encode_resolve_market(),
         };

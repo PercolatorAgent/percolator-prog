@@ -1717,11 +1717,11 @@ pub mod state {
         /// 0 = insurance_floor cannot be changed after init.
         pub max_insurance_floor_change_per_day: u128,
         /// Last slot when insurance_floor was changed (for rate-limiting).
-        pub last_insurance_floor_change_slot: u64,
+        pub resolution_slot: u64,
         /// Padding for u128 alignment.
         pub _ifc_padding: u64,
         /// Insurance floor value at last change (for computing delta).
-        pub last_insurance_floor_value: u128,
+        pub last_mark_push_slot: u128,
         /// Last slot when insurance was withdrawn (for live-market cooldown tracking).
         /// Uses a dedicated field to avoid overwriting oracle config fields.
         pub last_insurance_withdraw_slot: u64,
@@ -2360,14 +2360,18 @@ pub mod oracle {
             // far behind now_slot. Prevents trades/withdrawals from using a
             // stale smoothed index after a long crank gap.
             // Use max_staleness_secs * 3 as slot proxy (1 sec ≈ 2.5 slots).
-            // Cap at u64::MAX to prevent overflow with large max_staleness_secs.
-            let max_stale_slots = if config.max_staleness_secs > u64::MAX / 3 {
-                u64::MAX // effectively disabled for very large staleness configs
-            } else {
-                config.max_staleness_secs * 3
-            };
-            if now_slot.saturating_sub(engine_last_slot) > max_stale_slots {
-                return Err(super::error::PercolatorError::OracleStale.into());
+            // Stale mark check: use last_mark_push_slot (dedicated field),
+            // not engine.current_slot (which advances on user activity).
+            let last_push = config.last_mark_push_slot as u64;
+            if last_push > 0 {
+                let max_stale_slots = if config.max_staleness_secs > u64::MAX / 3 {
+                    u64::MAX
+                } else {
+                    config.max_staleness_secs * 3
+                };
+                if now_slot.saturating_sub(last_push) > max_stale_slots {
+                    return Err(super::error::PercolatorError::OracleStale.into());
+                }
             }
 
             let prev_index = config.last_effective_price_e6;
@@ -3112,9 +3116,9 @@ pub mod processor {
                     insurance_withdraw_cooldown_slots,
                     _iw_padding2: 0,
                     max_insurance_floor_change_per_day,
-                    last_insurance_floor_change_slot: clock.slot,
+                    resolution_slot: clock.slot,
                     _ifc_padding: 0,
-                    last_insurance_floor_value: insurance_floor,
+                    last_mark_push_slot: 0,
                     last_insurance_withdraw_slot: 0,
                     _liw_padding: 0,
                 };
@@ -3188,11 +3192,28 @@ pub mod processor {
 
                 let engine = zc::engine_mut(&mut data)?;
                 // Canonical deposit-based materialization (spec §10.3).
-                // deposit() materializes at free_head when slot is unused,
-                // enforcing min_initial_deposit.
                 let idx = engine.free_head;
                 engine.deposit(idx, units as u128, 0, clock.slot)
                     .map_err(map_risk_error)?;
+                // Charge new_account_fee: deduct from capital → insurance
+                // Tokens are already in the vault from deposit() above, so we
+                // only move the internal accounting (capital → insurance) without
+                // touching engine.vault (which was already incremented by deposit).
+                let fee = engine.params.new_account_fee.get();
+                if fee > 0 {
+                    let cap = engine.accounts[idx as usize].capital.get();
+                    if cap < fee {
+                        return Err(PercolatorError::EngineInsufficientBalance.into());
+                    }
+                    engine.accounts[idx as usize].capital = percolator::U128::new(cap - fee);
+                    engine.c_tot = percolator::U128::new(
+                        engine.c_tot.get().saturating_sub(fee),
+                    );
+                    let new_ins = engine.insurance_fund.balance.get()
+                        .checked_add(fee)
+                        .ok_or(ProgramError::ArithmeticOverflow)?;
+                    engine.insurance_fund.balance = percolator::U128::new(new_ins);
+                }
                 engine.set_owner(idx, a_user.key.to_bytes())
                     .map_err(map_risk_error)?;
             }
@@ -3249,11 +3270,26 @@ pub mod processor {
                 state::write_dust_base(&mut data, old_dust.saturating_add(dust));
 
                 let engine = zc::engine_mut(&mut data)?;
-                // Canonical deposit-based materialization (spec §10.3).
                 let idx = engine.free_head;
                 engine.deposit(idx, units as u128, 0, clock.slot)
                     .map_err(map_risk_error)?;
-                // Set LP fields on the materialized account
+                // Charge new_account_fee: capital → insurance (no vault change)
+                let fee = engine.params.new_account_fee.get();
+                if fee > 0 {
+                    let cap = engine.accounts[idx as usize].capital.get();
+                    if cap < fee {
+                        return Err(PercolatorError::EngineInsufficientBalance.into());
+                    }
+                    engine.accounts[idx as usize].capital = percolator::U128::new(cap - fee);
+                    engine.c_tot = percolator::U128::new(
+                        engine.c_tot.get().saturating_sub(fee),
+                    );
+                    let new_ins = engine.insurance_fund.balance.get()
+                        .checked_add(fee)
+                        .ok_or(ProgramError::ArithmeticOverflow)?;
+                    engine.insurance_fund.balance = percolator::U128::new(new_ins);
+                }
+                // Set LP fields
                 engine.accounts[idx as usize].kind = percolator::Account::KIND_LP;
                 engine.accounts[idx as usize].matcher_program = matcher_program.to_bytes();
                 engine.accounts[idx as usize].matcher_context = matcher_context.to_bytes();
@@ -3395,7 +3431,7 @@ pub mod processor {
                 // locally-settled state — same as AdminForceCloseAccount.
                 if resolved {
                     let _ = engine.touch_account_full(
-                        user_idx as usize, price, clock.slot,
+                        user_idx as usize, price, config.resolution_slot,
                     );
                 }
 
@@ -3407,8 +3443,10 @@ pub mod processor {
                 // Convert requested base tokens to units
                 let (units_requested, _) = crate::units::base_to_units(amount, config.unit_scale);
 
+                // Use frozen time on resolved markets
+                let withdraw_slot = if resolved { config.resolution_slot } else { clock.slot };
                 engine
-                    .withdraw(user_idx, units_requested as u128, price, clock.slot,
+                    .withdraw(user_idx, units_requested as u128, price, withdraw_slot,
                         compute_current_funding_rate(&config))
                     .map_err(map_risk_error)?;
 
@@ -3468,11 +3506,8 @@ pub mod processor {
                         return Err(ProgramError::InvalidAccountData);
                     }
 
-                    // Read frozen slot from engine (NOT clock.slot)
-                    let frozen_slot = {
-                        let eng = zc::engine_ref(&data)?;
-                        eng.current_slot
-                    };
+                    // Use resolution_slot (snapshotted in ResolveMarket)
+                    let frozen_slot = config.resolution_slot;
 
                     // Dust sweep: resolved crank must also sweep dust so
                     // CloseSlab's dust_base == 0 check can eventually pass.
@@ -3963,6 +3998,7 @@ pub mod processor {
                             config.oracle_price_cap_e2bps,
                         );
                         config.authority_price_e6 = clamped_mark;
+                        config.last_mark_push_slot = clock.slot as u128;
                     }
                     state::write_config(&mut data, &config);
                 }
@@ -4103,8 +4139,8 @@ pub mod processor {
                     sol_log_compute_units();
                 }
                 let amt_units = if resolved {
-                    // Use frozen time (engine.current_slot from last crank).
-                    let frozen_slot = engine.current_slot;
+                    // Use resolution_slot (snapshotted in ResolveMarket).
+                    let frozen_slot = config.resolution_slot;
                     let funding_rate = compute_current_funding_rate(&config);
                     engine.close_account(user_idx, frozen_slot, price, funding_rate)
                         .or_else(|_| engine.force_close_resolved(user_idx))
@@ -4379,7 +4415,13 @@ pub mod processor {
                 config.funding_inv_scale_notional_e6 = funding_inv_scale_notional_e6;
                 config.funding_max_premium_bps = funding_max_premium_bps;
                 config.funding_max_bps_per_slot = funding_max_bps_per_slot;
+                // Sync engine funding rate to reflect updated config
+                let new_rate = compute_current_funding_rate(&config);
                 state::write_config(&mut data, &config);
+                if oracle::is_hyperp_mode(&config) {
+                    let engine = zc::engine_mut(&mut data)?;
+                    engine.funding_rate_bps_per_slot_last = new_rate;
+                }
             }
 
             Instruction::SetOracleAuthority { new_authority } => {
@@ -4484,15 +4526,21 @@ pub mod processor {
                     config.oracle_price_cap_e2bps,
                 );
                 config.authority_price_e6 = clamped;
-                if !is_hyperp {
+                if is_hyperp {
+                    let push_clock = Clock::get().unwrap_or_default();
+                    config.last_mark_push_slot = push_clock.slot as u128;
+                } else {
                     config.authority_timestamp = timestamp;
                     config.last_effective_price_e6 = clamped;
                 }
-                // In Hyperp mode: only authority_price_e6 (mark) is updated.
-                // last_effective_price_e6 (index) is NOT set to clamped — the
-                // engine's clamp_toward_with_dt handles index smoothing.
-                // authority_timestamp stores funding rate state, not unix time.
+                // Compute funding rate from final config state before write
+                let new_rate = compute_current_funding_rate(&config);
                 state::write_config(&mut data, &config);
+                // Sync engine's stored funding rate
+                if is_hyperp {
+                    let engine = zc::engine_mut(&mut data)?;
+                    engine.funding_rate_bps_per_slot_last = new_rate;
+                }
             }
 
             Instruction::SetOraclePriceCap { max_change_e2bps } => {
@@ -4534,11 +4582,11 @@ pub mod processor {
             }
 
             Instruction::ResolveMarket => {
-                // Resolve market: set RESOLVED flag, use admin oracle price for settlement
-                // Positions are force-closed via subsequent KeeperCrank calls (paginated)
-                accounts::expect_len(accounts, 2)?;
+                // Resolve market: snapshot resolution slot, set RESOLVED flag.
+                accounts::expect_len(accounts, 3)?;
                 let a_admin = &accounts[0];
                 let a_slab = &accounts[1];
+                let a_clock = &accounts[2];
 
                 accounts::expect_signer(a_admin)?;
                 accounts::expect_writable(a_slab)?;
@@ -4579,7 +4627,12 @@ pub mod processor {
                     }
                 }
 
-                // Set the resolved flag
+                // Snapshot the resolution slot and set the resolved flag.
+                // All resolved-path operations use this frozen slot.
+                let clock = Clock::from_account_info(a_clock)?;
+                let mut config = config; // shadow for write
+                config.resolution_slot = clock.slot;
+                state::write_config(&mut data, &config);
                 state::set_resolved(&mut data);
             }
 
@@ -5001,7 +5054,7 @@ pub mod processor {
                 // Best-effort touch to settle K-pair PnL at settlement price.
                 // May fail for same-epoch accounts — that's fine, force_close_resolved
                 // handles settlement independently.
-                let frozen_slot = engine.current_slot;
+                let frozen_slot = config.resolution_slot;
                 let _ = engine.touch_account_full(user_idx as usize, price, frozen_slot);
 
                 // Try canonical close first (handles stale-epoch accounts
