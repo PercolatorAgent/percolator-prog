@@ -16,7 +16,7 @@ pub mod constants {
     use percolator::RiskEngine;
 
     pub const MAGIC: u64 = 0x504552434f4c4154; // "PERCOLAT"
-    pub const VERSION: u32 = 1;
+    pub const VERSION: u32 = 2; // v2: resolution_slot, last_mark_push_slot repurposed fields
 
     pub const HEADER_LEN: usize = size_of::<SlabHeader>();
     pub const CONFIG_LEN: usize = size_of::<MarketConfig>();
@@ -3118,7 +3118,9 @@ pub mod processor {
                     max_insurance_floor_change_per_day,
                     resolution_slot: clock.slot,
                     _ifc_padding: 0,
-                    last_mark_push_slot: 0,
+                    // Hyperp: stamp init slot so stale check works from genesis.
+                    // Non-Hyperp: 0 (no mark push concept).
+                    last_mark_push_slot: if is_hyperp { clock.slot as u128 } else { 0 },
                     last_insurance_withdraw_slot: 0,
                     _liw_padding: 0,
                 };
@@ -4415,13 +4417,12 @@ pub mod processor {
                 config.funding_inv_scale_notional_e6 = funding_inv_scale_notional_e6;
                 config.funding_max_premium_bps = funding_max_premium_bps;
                 config.funding_max_bps_per_slot = funding_max_bps_per_slot;
-                // Sync engine funding rate to reflect updated config
-                let new_rate = compute_current_funding_rate(&config);
+                // Do NOT sync engine.funding_rate_bps_per_slot_last here.
+                // Anti-retroactivity: the engine's stored rate is stamped
+                // only by keeper_crank → recompute_r_last_from_final_state.
+                // Direct writes would apply the new rate retroactively over
+                // the gap since last_market_slot.
                 state::write_config(&mut data, &config);
-                if oracle::is_hyperp_mode(&config) {
-                    let engine = zc::engine_mut(&mut data)?;
-                    engine.funding_rate_bps_per_slot_last = new_rate;
-                }
             }
 
             Instruction::SetOracleAuthority { new_authority } => {
@@ -4527,20 +4528,16 @@ pub mod processor {
                 );
                 config.authority_price_e6 = clamped;
                 if is_hyperp {
-                    let push_clock = Clock::get().unwrap_or_default();
+                    let push_clock = Clock::get()
+                        .map_err(|_| ProgramError::UnsupportedSysvar)?;
                     config.last_mark_push_slot = push_clock.slot as u128;
                 } else {
                     config.authority_timestamp = timestamp;
                     config.last_effective_price_e6 = clamped;
                 }
-                // Compute funding rate from final config state before write
-                let new_rate = compute_current_funding_rate(&config);
+                // Do NOT sync engine.funding_rate_bps_per_slot_last here.
+                // Anti-retroactivity: rate is stamped only by keeper_crank.
                 state::write_config(&mut data, &config);
-                // Sync engine's stored funding rate
-                if is_hyperp {
-                    let engine = zc::engine_mut(&mut data)?;
-                    engine.funding_rate_bps_per_slot_last = new_rate;
-                }
             }
 
             Instruction::SetOraclePriceCap { max_change_e2bps } => {
