@@ -16,7 +16,7 @@ pub mod constants {
     use percolator::RiskEngine;
 
     pub const MAGIC: u64 = 0x504552434f4c4154; // "PERCOLAT"
-    pub const VERSION: u32 = 2; // v2: resolution_slot, last_mark_push_slot repurposed fields
+    pub const VERSION: u32 = 1;
 
     pub const HEADER_LEN: usize = size_of::<SlabHeader>();
     pub const CONFIG_LEN: usize = size_of::<MarketConfig>();
@@ -2623,7 +2623,7 @@ pub mod processor {
             let loss = engine.accounts[i].pnl.unsigned_abs();
             // absorb_protocol_loss: deduct from insurance fund
             let ins_bal = engine.insurance_fund.balance.get();
-            let available = ins_bal.saturating_sub(engine.insurance_floor);
+            let available = ins_bal.saturating_sub(engine.params.insurance_floor.get());
             let ins_pay = core::cmp::min(loss, available);
             if ins_pay > 0 {
                 engine.insurance_fund.balance = U128::new(ins_bal - ins_pay);
@@ -4277,7 +4277,15 @@ pub mod processor {
                     let frozen_slot = config.resolution_slot;
                     let funding_rate = compute_current_funding_rate(&config);
                     engine.close_account(user_idx, frozen_slot, price, funding_rate)
-                        .or_else(|_| settle_and_close_resolved(engine, user_idx))
+                        .or_else(|e| match e {
+                            // Same-epoch open position: canonical close fails,
+                            // use wrapper-side position zeroing + settlement.
+                            percolator::RiskError::Unauthorized
+                            | percolator::RiskError::Undercollateralized
+                            | percolator::RiskError::InsufficientBalance
+                                => settle_and_close_resolved(engine, user_idx),
+                            other => Err(other),
+                        })
                         .map_err(map_risk_error)?
                 } else {
                     engine
@@ -5203,6 +5211,8 @@ pub mod processor {
                 let funding_rate = compute_current_funding_rate(&config);
                 let amt_units = engine.close_account(
                     user_idx, frozen_slot, price, funding_rate,
+                // Admin force-close: broad fallback — admin must be able to
+                // close any account regardless of engine error type.
                 ).or_else(|_| settle_and_close_resolved(engine, user_idx))
                     .map_err(map_risk_error)?;
                 let amt_units_u64: u64 = amt_units
