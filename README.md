@@ -21,7 +21,7 @@
   <code>Percolator Prog contract: DeEZjof4vkwC4MH1bWCLpRexpmrDrQBvJiiAYBZCBAGS </code>
 </p>
 <p align="center">
-   <a href="#"> Bags Hackathon link</a>
+   <a href="https://bags.fm/apps/2df8aa22-6e1e-4c03-981c-743fbe2dac29"> Bags Hackathon </a>
 </p>
 > **DISCLAIMER: FOR EDUCATIONAL PURPOSES ONLY**
 >
