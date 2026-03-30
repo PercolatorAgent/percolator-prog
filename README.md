@@ -18,7 +18,7 @@
   <code>Wallet Address: 4JXGCzLYJUx5LdHvMBvNMKzFzmWqULdxxqewtUtLDo7N</code>
 </p>
 <p align="center">
-  <code>Percolator Prog contract: </code>
+  <code>Percolator Prog contract: DeEZjof4vkwC4MH1bWCLpRexpmrDrQBvJiiAYBZCBAGS </code>
 </p>
 <p align="center">
    <a href="#"> Bags Hackathon link</a>
